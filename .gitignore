@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# Dear ImGui panel-layout state (auto-saved at runtime, not source)
+imgui.ini
+space_sim_layout.ini
+
+# screenshots saved via --shot
+*_shot_*.png
