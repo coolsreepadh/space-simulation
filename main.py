@@ -28,12 +28,15 @@ Scenes (number keys, or the Scenes panel)
     1  Solar System disk      Sun, all 8 planets + the 5 IAU dwarf planets on
                               their real Keplerian orbits (true eccentricity
                               and inclination, not flattened circles), major
-                              moons, Saturn's rings, asteroid/Kuiper belts, a
-                              thick Oort cloud shell, the heliosphere, and
-                              real space-mission trajectories -- see the
-                              "Solar System" panel
-    2  Galaxy Merger          two live bulge+halo disk galaxies on a grazing
-                              prograde encounter -- bridge, tidal tails, merger
+                              moons, Saturn's rings, asteroid/Kuiper belts,
+                              and real space-mission trajectories.  The Oort
+                              cloud and the heliosphere are switchable in the
+                              "Solar System" panel: both are far enough out
+                              that seeing either means leaving the planets as
+                              a knot in the middle
+    2  Galaxy Merger          two live spiral galaxies, bulge + halo + disk,
+                              on a grazing prograde encounter -- bridge,
+                              tidal tails, merger
     3  Black hole (10 M_sun) a BARE Schwarzschild hole -- press X to drop a
                               star on it and watch tides shred it into a
                               stream that circularises into the disk
@@ -49,7 +52,7 @@ Controls
     SPACE        pause                   [ / ]     slower / faster
     L            toggle lensing          F         reset view
     N            toggle body names       O         toggle orbit paths
-    X            spawn a star (scene 3)
+    X            spawn a star (scene 3)  V         draw material as gas
     G            hide/show panels        F11       fullscreen
     ESC          quit
 
@@ -77,7 +80,7 @@ def parse_args(argv=None):
     ap.add_argument("--height", type=int, default=0)
     ap.add_argument("--scale", type=float, default=0.85,
                     help="internal render scale; lower = faster lensing")
-    ap.add_argument("--steps", type=int, default=170,
+    ap.add_argument("--steps", type=int, default=260,
                     help="max geodesic integration steps per pixel")
     ap.add_argument("--halo", type=int, default=1400,
                     help="live halo particles per galaxy (massive)")
@@ -112,7 +115,7 @@ from imgui_bundle.python_backends.pygame_backend import PygameRenderer  # noqa: 
 # Taichi state
 # ---------------------------------------------------------------------------
 
-MAX_N = 40000
+MAX_N = 80000
 
 pos  = ti.Vector.field(3, ti.f32, shape=MAX_N)
 vel  = ti.Vector.field(3, ti.f32, shape=MAX_N)
@@ -136,30 +139,40 @@ def k_upload(n: ti.i32,
 
 
 @ti.kernel
-def k_accel(n: ti.i32, n_src: ti.i32, gconst: ti.f32, pw_rs: ti.f32):
+def k_accel(n: ti.i32, src_lo: ti.i32, src_hi: ti.i32,
+            gconst: ti.f32, pw_rs: ti.f32):
     """Direct-sum gravity.
 
-    Sources are indices [0, n_src): the massive bodies.  Every particle in
-    [0, n) is accelerated by them, so a scene can mix live self-gravitating
-    matter (n_src == n) with massless tracers (n_src << n) at a fraction of
-    the O(N^2) cost.
+    Sources are indices [src_lo, src_hi): the massive bodies.  Every particle
+    in [0, n) is accelerated by them, so a scene can mix live self-gravitating
+    matter with massless tracers at a fraction of the O(N^2) cost.
 
-    If pw_rs > 0 the body at index 0 uses the Paczynski-Wiita pseudo-Newtonian
-    potential, -GM/(r - r_s), which reproduces the Schwarzschild ISCO at 3 r_s
-    and makes orbits inside it plunge.
+    The source set is a *range* rather than a prefix so that the black hole
+    scene can give self-gravity to just the one star that is still whole
+    while several earlier debris streams are on the board: those are long
+    since dominated by the hole, and including them would push the O(N^2)
+    inner loop up by the square of the number of stars for no visible gain.
+
+    If pw_rs > 0 the body at index 0 is the hole and is always a source,
+    outside the range, through the Paczynski-Wiita pseudo-Newtonian
+    potential -GM/(r - r_s), which reproduces the Schwarzschild ISCO at 3 r_s
+    and makes orbits inside it plunge.  Callers in that case pass src_lo >= 1
+    so it is not also counted as an ordinary Newtonian source.
     """
     for i in range(n):
         a = ti.Vector([0.0, 0.0, 0.0])
         pi = pos[i]
-        for j in range(n_src):
+        if pw_rs > 0.0:
+            d = pos[0] - pi
+            r2 = d.dot(d) + sft2[0]
+            r = ti.sqrt(r2)
+            rr = ti.max(r - pw_rs, 0.35 * pw_rs)
+            a += (gconst * mass[0] / (rr * rr * r)) * d
+        for j in range(src_lo, src_hi):
             d = pos[j] - pi
             r2 = d.dot(d) + sft2[j]
             r = ti.sqrt(r2)
-            f = gconst * mass[j] / (r2 * r)
-            if pw_rs > 0.0 and j == 0:
-                rr = ti.max(r - pw_rs, 0.35 * pw_rs)
-                f = gconst * mass[j] / (rr * rr * r)
-            a += f * d
+            a += (gconst * mass[j] / (r2 * r)) * d
         acc[i] = a
 
 
@@ -244,6 +257,11 @@ def k_swallow(lo: ti.i32, hi: ti.i32, rs: ti.f32, sustain: ti.i32,
               jet_range: ti.f32) -> ti.i32:
     """Handle whatever reaches the hole.
 
+    Material put back is given a scale height and a little vertical motion:
+    dropped into the midplane exactly, and then damped towards it, the disk
+    ends up with no thickness at all, and a disk of no thickness is a hard
+    bright line on screen rather than a band of gas.
+
     With sustain off it is simply gone: massless and parked far away, so the
     disk drains and the hole eventually finishes its meal.  With sustain on the
     same material is resupplied at the feed radius on a circular orbit, which
@@ -262,14 +280,20 @@ def k_swallow(lo: ti.i32, hi: ti.i32, rs: ti.f32, sustain: ti.i32,
         if abs(pos[i][1]) > 0.45 * r_i:
             limit = jet_range      # jet material loops back sooner, keeping the
                                    # beam short and dense enough to read as one
-        if sustain == 1 and mass[i] > 0.0 and r_i > limit:
+        # Parked-at-the-graveyard is the test for "already dealt with", not
+        # zero mass: most of a star is massless tracer particles, and keying
+        # off mass would let all of them fall straight through the horizon.
+        live = r_i < 0.5 * GRAVEYARD
+        if sustain == 1 and live and r_i > limit:
             ang = ti.random() * 6.2831853
             rr = feed_r * (0.90 + 0.20 * ti.random())
             pos[i] = ti.Vector([rr * ti.cos(ang),
-                                (ti.random() - 0.5) * 0.02 * rr,
+                                (ti.random() - 0.5) * 0.06 * rr,
                                 rr * ti.sin(ang)])
             vc = ti.sqrt(gm * rr) / ti.max(rr - rs, 1e-3)
-            vel[i] = ti.Vector([-vc * ti.sin(ang), 0.0, vc * ti.cos(ang)])
+            vel[i] = ti.Vector([-vc * ti.sin(ang),
+                                (ti.random() - 0.5) * 0.06 * vc,
+                                vc * ti.cos(ang)])
         # 2.5 r_s, not the horizon itself: anything this far inside the 3 r_s
         # ISCO has no stable orbit left and is already committed to falling in,
         # and capturing it out here keeps it well clear of the radius where the
@@ -277,16 +301,18 @@ def k_swallow(lo: ti.i32, hi: ti.i32, rs: ti.f32, sustain: ti.i32,
         # slingshot it straight back out at escape speed.  Checked every
         # substep for the same reason -- one frame of travel is enough for a
         # fast plunging orbit to dive deep between checks.
-        if mass[i] > 0.0 and pos[i].norm() < 2.5 * rs:
+        if live and pos[i].norm() < 2.5 * rs:
             _swallowed[0] += 1
             if sustain == 1:
                 ang = ti.random() * 6.2831853
                 rr = feed_r * (0.90 + 0.20 * ti.random())
                 pos[i] = ti.Vector([rr * ti.cos(ang),
-                                    (ti.random() - 0.5) * 0.02 * rr,
+                                    (ti.random() - 0.5) * 0.06 * rr,
                                     rr * ti.sin(ang)])
                 vc = ti.sqrt(gm * rr) / ti.max(rr - rs, 1e-3)
-                vel[i] = ti.Vector([-vc * ti.sin(ang), 0.0, vc * ti.cos(ang)])
+                vel[i] = ti.Vector([-vc * ti.sin(ang),
+                                    (ti.random() - 0.5) * 0.06 * vc,
+                                    vc * ti.cos(ang)])
             else:
                 mass[i] = 0.0
                 vel[i] = ti.Vector([0.0, 0.0, 0.0])
@@ -319,7 +345,7 @@ def k_jet(lo: ti.i32, hi: ti.i32, rate: ti.f32, r_source: ti.f32,
             if ti.random() < 0.5:
                 sign = -1.0
             ang = ti.random() * 6.2831853
-            rad = 0.55 * ti.sqrt(ti.random())
+            rad = 0.30 * ti.sqrt(ti.random())
             pos[i] = ti.Vector([rad * ti.cos(ang), sign * base, rad * ti.sin(ang)])
             lat = spread * v_jet * ti.sqrt(ti.random())
             vel[i] = ti.Vector([lat * ti.cos(ang), sign * v_jet, lat * ti.sin(ang)])
@@ -338,6 +364,32 @@ def k_balance_momentum(n: ti.i32):
         _red[0] += ti.Vector([mv[0], mv[1], mv[2], 0.0])
     if mass[0] > 0.0:
         vel[0] = -ti.Vector([_red[0][0], _red[0][1], _red[0][2]]) / mass[0]
+
+
+@ti.kernel
+def k_recentre(n: ti.i32):
+    """Put the system's centre of mass back at the origin.
+
+    The hole's velocity is pinned by k_balance_momentum, but nothing pins its
+    position, and several things here do not conserve momentum on their own:
+    the viscous damping bleeds it out of the gas, and the swallow-and-resupply
+    teleports move material across the box in a single step.  Each of those
+    makes the hole's pinned velocity jump, and the integral of those jumps is
+    a random walk.  With the default feather-weight star it is invisible; give
+    the star a few solar masses and the hole walks clean out of its own disk
+    inside a few thousand time units.  Pinning the barycentre costs nothing and
+    still lets the hole orbit it, which with a heavy star it genuinely should.
+    """
+    _red[0] = ti.Vector([0.0, 0.0, 0.0, 0.0])
+    for i in range(n):
+        m = mass[i]
+        if m > 0.0:
+            _red[0] += ti.Vector([m * pos[i][0], m * pos[i][1], m * pos[i][2], m])
+    tm = _red[0][3]
+    if tm > 0.0:
+        c = ti.Vector([_red[0][0], _red[0][1], _red[0][2]]) / tm
+        for i in range(n):
+            pos[i] -= c
 
 
 @ti.kernel
@@ -368,7 +420,10 @@ def k_circularise(lo: ti.i32, hi: ti.i32, frac: ti.f32, tang: ti.f32,
             rhat = pos[i] / r
             vr = vel[i].dot(rhat)
             vel[i] -= rhat * (vr * frac)
-            vel[i][1] -= vel[i][1] * (frac * 0.25)
+            # only lightly: the vertical motion is what gives the disk its
+            # thickness, and damping it as hard as the radial component
+            # flattens the disk onto the midplane exactly
+            vel[i][1] -= vel[i][1] * (frac * 0.10)
             v_tan = vel[i] - rhat * vel[i].dot(rhat)
             vel[i] -= v_tan * (frac * tang)
 
@@ -430,6 +485,123 @@ def k_update_satellites(n_dyn: ti.i32, n_sat: ti.i32, t: ti.f32):
         pos[i] = pos[sat_parent[k]] + off
 
 
+# --- the debris as a gas ----------------------------------------------------
+#
+# Tidal debris is gas, not gravel.  Drawn as one point sprite per body it never
+# stops looking like a swarm of separate objects, however many bodies there are
+# and however soft the sprites: the eye picks out individual specks in anything
+# but the very densest part, and a star drawn that way is a ball of grit rather
+# than something luminous and continuous.
+#
+# So the bodies are only how the material is *moved*.  What is *drawn* is a
+# density field: every frame the particles are splatted into a regular grid
+# centred on the hole, smoothed, and handed to the renderer as a 3D texture,
+# which the ray marcher then integrates as an emissive, absorbing medium along
+# the same bent rays it already uses for everything else.  The star, the
+# stream it is drawn out into and the disk it settles into are then literally
+# the same substance -- one field, one emission model -- so they blend into
+# each other instead of meeting at a seam.
+#
+# The grid is uniform rather than graded towards the hole.  A graded one buys
+# resolution in the inner disk, but it spends it exactly where the ray-marched
+# disk already supplies fine structure, and it takes it from the radii where
+# the infalling star is -- which is the one place a few cells across is
+# obviously not enough.
+#
+# The extent is a per-scene number rather than a constant, and for the black
+# hole it is stretched at spawn time to reach wherever the star is dropped
+# from.  A fixed box shows up as a straight edge across the sky as soon as any
+# material reaches it, and material past it simply vanishes; the density is
+# also faded to nothing over the outermost cells so that the boundary, wherever
+# it is, dissolves rather than cuts.
+GAS_NX, GAS_NY, GAS_NZ = 160, 56, 160
+GAS_RX, GAS_RY = 110.0, 30.0       # default half-extents: wide and flat, which
+                                   # is the shape the material usually takes
+
+gas_a = ti.field(ti.f32, shape=(GAS_NZ, GAS_NY, GAS_NX))
+gas_b = ti.field(ti.f32, shape=(GAS_NZ, GAS_NY, GAS_NX))
+# What actually crosses back to the CPU each frame.  A byte per cell, not a
+# float: the field has to be read back and handed to the driver every frame,
+# and at this size that copy, not the splat or the smoothing, is the whole
+# cost of the technique -- four times the bytes was four times the price for
+# precision a glow cannot show.  Square-rooted before quantising, so the
+# resolution is spent on the faint material where the eye can see steps.
+gas_u8 = ti.field(ti.u8, shape=(GAS_NZ, GAS_NY, GAS_NX))
+GAS_DREF = 420.0         # density that saturates the byte: a little above
+                         # what the core of an intact star reaches
+
+
+@ti.kernel
+def k_gas_quantise(src: ti.template()):
+    for I in ti.grouped(src):
+        v = ti.sqrt(ti.min(src[I] * (1.0 / GAS_DREF), 1.0))
+        gas_u8[I] = ti.cast(v * 255.0 + 0.5, ti.u8)
+
+
+@ti.kernel
+def k_gas_splat(lo: ti.i32, hi: ti.i32, amp: ti.f32, rx: ti.f32, ry: ti.f32):
+    """Trilinear splat of every live particle into the density grid.
+
+    Weighted equally rather than by mass: most of a star is massless tracers
+    (see make_star), and they stand for exactly as much material as the few
+    that carry the gravity do -- and in the galaxy scene the massive component
+    is dark matter, which should not be drawn at all.  Which particles to
+    splat is therefore the caller's business, through lo and hi."""
+    for I in ti.grouped(gas_a):
+        gas_a[I] = 0.0
+    for i in range(lo, hi):
+        q = pos[i]
+        gx = (q[0] / rx * 0.5 + 0.5) * GAS_NX - 0.5
+        gy = (q[1] / ry * 0.5 + 0.5) * GAS_NY - 0.5
+        gz = (q[2] / rx * 0.5 + 0.5) * GAS_NZ - 0.5
+        if (0.0 <= gx) and (gx < GAS_NX - 1) and (0.0 <= gy) and            (gy < GAS_NY - 1) and (0.0 <= gz) and (gz < GAS_NZ - 1):
+            ix, iy, iz = int(gx), int(gy), int(gz)
+            fx, fy, fz = gx - ix, gy - iy, gz - iz
+            for k in ti.static(range(8)):
+                dx = ti.static(k & 1)
+                dy = ti.static((k >> 1) & 1)
+                dz = ti.static((k >> 2) & 1)
+                wx = fx if dx == 1 else 1.0 - fx
+                wy = fy if dy == 1 else 1.0 - fy
+                wz = fz if dz == 1 else 1.0 - fz
+                gas_a[iz + dz, iy + dy, ix + dx] += amp * wx * wy * wz
+
+
+@ti.kernel
+def k_gas_blur(src: ti.template(), dst: ti.template(), axis: ti.template()):
+    """One separable 1-4-6-4-1 pass.  Three of these turn the splat, which is
+    still one particle per cell wherever the material is thin, into something
+    with a smoothing length of a couple of cells -- the difference between a
+    field that reads as gas and one that reads as a grid of lit voxels."""
+    for z, y, x in dst:
+        acc = 0.0
+        for t in ti.static(range(5)):
+            o = t - 2
+            sx = x + (o if axis == 0 else 0)
+            sy = y + (o if axis == 1 else 0)
+            sz = z + (o if axis == 2 else 0)
+            w = ti.static([0.0625, 0.25, 0.375, 0.25, 0.0625][t])
+            inside = (sx >= 0) and (sx < GAS_NX) and (sy >= 0) and                      (sy < GAS_NY) and (sz >= 0) and (sz < GAS_NZ)
+            if inside:
+                acc += w * src[sz, sy, sx]
+        dst[z, y, x] = acc
+
+
+def build_gas(scene, amp):
+    """Splat, smooth, quantise, and hand back the field for upload.
+
+    The grid is centred on the origin, not on the central body: every scene
+    that uses it already pins its barycentre there, and with a heavy star the
+    hole itself swings about that point rather than sitting at it."""
+    rx, ry = scene.gas_half
+    k_gas_splat(scene.gas_lo, scene.n_dynamic, amp, rx, ry)
+    k_gas_blur(gas_a, gas_b, 0)
+    k_gas_blur(gas_b, gas_a, 1)
+    k_gas_blur(gas_a, gas_b, 2)
+    k_gas_quantise(gas_b)
+    return gas_u8.to_numpy()
+
+
 # ---------------------------------------------------------------------------
 # Scene description
 # ---------------------------------------------------------------------------
@@ -442,7 +614,8 @@ class Scene:
                  bh=False, disk_in=0.0, disk_out=0.0, recycle=None,
                  cam_dist=100.0, cam_yaw=0.0, cam_pitch=0.35, cam_target=(0, 0, 0),
                  fov=55.0, gain=1.0, world_rs=1.0, kill_drift=True,
-                 n_dynamic=None, satellites=None, labels=None, polylines=None):
+                 n_dynamic=None, satellites=None, labels=None, polylines=None,
+                 gas="", gas_half=(GAS_RX, GAS_RY), gas_lo=1, extras=()):
         self.name = name
         self.pos = np.ascontiguousarray(pos, dtype=np.float32)
         self.vel = np.ascontiguousarray(vel, dtype=np.float32)
@@ -468,6 +641,23 @@ class Scene:
         self.gain = float(gain)
         self.world_rs = float(world_rs)
         self.kill_drift = bool(kill_drift)
+        # How this scene can be drawn as gas rather than as separate points.
+        #
+        #   "volume"  splat the particles into a 3D density grid and ray-march
+        #             it as an emitting, absorbing medium.  Needed wherever the
+        #             light is bent or the material hides itself, which means
+        #             the black hole; it costs a grid readback every frame and
+        #             its resolution is whatever the grid is.
+        #   "screen"  draw the points, then blur that buffer before the rest of
+        #             the pipeline sees it.  A galaxy is optically thin, so
+        #             simply adding up its light along the ray is not an
+        #             approximation but the right answer -- and doing it in
+        #             screen space keeps full pixel resolution and each
+        #             particle's own colour, which a grid coarse enough to hold
+        #             a whole merger would throw away.
+        self.gas = str(gas or "")
+        self.gas_half = (float(gas_half[0]), float(gas_half[1]))
+        self.gas_lo = int(gas_lo)
         self.attrib = np.empty((self.n, 4), dtype=np.float32)
         self.attrib[:, 0:3] = self.col
         self.attrib[:, 3] = self.size
@@ -496,6 +686,12 @@ class Scene:
         # points to draw" with no extra bookkeeping.
         self.n_base = self.n_dynamic + self.n_sat
 
+        # Named blocks inside the static-extras region, each drawn or not on
+        # its own: (name, first index, count).  They live past n_base, so no
+        # kernel ever touches them and leaving one out is simply a draw call
+        # not made.
+        self.extras = [(str(n), int(lo), int(c)) for n, lo, c in extras]
+
         # (particle_index, display_name) pairs for the optional name-label overlay
         self.labels = list(labels) if labels else []
         # orbit and mission-path polylines: dicts with pos (N,3) f32, color
@@ -507,9 +703,11 @@ class Scene:
         # n_dynamic -- and so outside gravity AND outside the draw call --
         # until a star is actually spawned into it.
         self.star_n = 0          # particles per star
+        self.star_src = 0        # of those, how many carry mass
         self.star_slots = 0      # how many stars can exist at once
         self.star_spawned = 0    # how many have been spawned so far
         self.star_cfg = None     # dict of physical parameters for a new star
+        self.star_lo = -1        # first index of the most recently dropped star
         self.accreted = 0        # particles the hole has eaten
 
 
@@ -527,9 +725,15 @@ def plummer_sphere(n, mtot, a, gconst, rng, vscale=1.0, rcut=8.0):
     would breathe violently for the first few dynamical times and smear out the
     tidal features we are after.
     """
-    x = rng.uniform(0.0, 1.0, n)
+    # Truncated by restricting the mass variable rather than by clipping the
+    # radius afterwards.  Clipping does not throw the tail away, it stacks it:
+    # every particle beyond the cut lands exactly on it, and for a cut at a few
+    # scale radii that is a fifth of the star welded into an infinitely thin
+    # shell.  On a star falling towards a hole that shell is the first thing
+    # the tide takes, and it leaves as a hollow bubble instead of an envelope.
+    xmax = (1.0 + 1.0 / (rcut * rcut)) ** -1.5
+    x = rng.uniform(0.0, xmax, n)
     r = a / np.sqrt(np.maximum(x ** (-2.0 / 3.0) - 1.0, 1e-9))
-    r = np.minimum(r, rcut * a)
     p = _sphere_dirs(n, rng) * r[:, None]
 
     q = np.zeros(n)
@@ -899,23 +1103,15 @@ def preset_solar_system(rng):
         r = np.cbrt(r0 ** 3 + u * (r1 ** 3 - r0 ** 3))     # uniform in volume
         dirs = _sphere_dirs(count, rng)
         pos_ = dirs * r[:, None]
-        # a slow, randomly oriented near-circular drift so the shell isn't inert
-        speed = np.sqrt(G * m_sun / r) * rng.uniform(0.15, 0.35, count)
-        tangent = _sphere_dirs(count, rng)
-        tangent -= dirs * np.sum(tangent * dirs, axis=1, keepdims=True)
-        tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-6)
+        # Held still rather than orbited.  A body four thousand units out has
+        # an orbital period some thousands of times longer than the run, so
+        # integrating it buys a motion of well under a pixel while costing a
+        # tenth of the scene's particle budget every step.
         P.extend(pos_.tolist())
-        V.extend((tangent * speed[:, None]).tolist())
+        V.extend([[0.0, 0.0, 0.0]] * count)
         M.extend([0.0] * count); S.extend([0.05] * count); R.extend([rad] * count)
         shade = rng.uniform(0.5, 1.3, count)[:, None]
         C.extend((np.array(tint)[None, :] * shade).tolist())
-
-    # Draw radius is large (not to scale with anything else) on purpose:
-    # at the camera distances where this shell is actually in frame (a few
-    # thousand units out), a physically-scaled point is sub-pixel and the
-    # point-sprite shader's distance falloff fades it to nothing well before
-    # that -- this is sized to still read as a dense, thick haze from there.
-    oort_cloud(9000, 2200.0, 4600.0, (0.74, 0.84, 1.00), 16.0)
 
     n_dynamic = len(P)   # [n_dynamic, n) below are kinematic satellites, not gravitating
 
@@ -987,15 +1183,28 @@ def preset_solar_system(rng):
         C.extend((np.array(tint)[None, :] * shade).tolist())
         return pos_
 
+    # Both shells are switchable extras, so they sit past everything the
+    # kernels touch.  Draw radius is large (not to scale with anything else)
+    # on purpose: at the camera distances where they are actually in frame, a
+    # physically-scaled point is sub-pixel and the sprite shader's distance
+    # falloff fades it to nothing well before that, so these are sized to read
+    # as a haze from out there.
+    extras = []
+    oort_lo = len(P)
+    oort_cloud(9000, 2200.0, 4600.0, (0.74, 0.84, 1.00), 16.0)
+    extras.append(("Oort cloud", oort_lo, len(P) - oort_lo))
+
+    helio_lo = len(P)
     helio_pos = heliosphere_shell(3200, 120.0, 100.0, 180.0, (0.45, 0.65, 1.00), 11.0)
     P.extend(helio_pos.tolist())
     V.extend([[0.0, 0.0, 0.0]] * int(helio_pos.shape[0]))
+    extras.append(("heliosphere / heliopause", helio_lo, len(P) - helio_lo))
 
     polylines = orbit_lines + _mission_paths()
 
     return Scene("Solar System", P, V, M, S, C, R,
                  n_src=n_src, n_dynamic=n_dynamic, satellites=satellites,
-                 labels=labels, polylines=polylines,
+                 labels=labels, polylines=polylines, extras=extras,
                  gconst=G, dt=0.06, substeps=3,
                  cam_dist=150.0, cam_pitch=0.42, gain=1.6, kill_drift=False)
 
@@ -1036,7 +1245,8 @@ def preset_galaxy_merger(rng):
     n_halo = n_heavy - n_bulge
     n_disk = max(500, min(ARGS.disk, (MAX_N - 2 * n_heavy) // 2))
 
-    r_d, r_min, r_max, h_z = 6.0, 3.0, 24.0, 0.45
+    r_d, r_min, r_max, h_z = 6.0, 2.0, 24.0, 0.45
+    n_arms, arm_strength = 2, 0.62
 
     # Pericentre at ~2x the disk radius: deep enough that the tidal radius cuts
     # into the outer disk, shallow enough that the material leaves as coherent
@@ -1082,6 +1292,23 @@ def preset_galaxy_merger(rng):
         ph = rng.uniform(0, 2 * math.pi, n_disk)
         z = rng.laplace(0.0, h_z, n_disk)
 
+        # Two-armed logarithmic spiral, put in by hand.  A cold exponential
+        # disk of test particles will not grow arms on its own here: the
+        # tracers are massless, so there is no self-gravity in the disk for a
+        # density wave to ride on, and even with one the pattern would take
+        # longer to appear than the encounter takes to happen.  So the arms are
+        # part of the initial condition -- each particle is pulled part of the
+        # way from where it was towards the nearest arm, at fixed radius, which
+        # leaves the orbits untouched and only moves material around in
+        # azimuth.  Differential rotation then winds them up, and the encounter
+        # tears them apart, both of which are real.
+        pitch = math.radians(20.0)
+        phi_arm = np.log(r / r_min) / math.tan(pitch)
+        off = np.angle(np.exp(1j * n_arms * (ph - phi_arm))) / n_arms
+        ph = ph - arm_strength * off
+        # arms are where the star formation is, so make them brighter and bluer
+        arm = np.exp(-((off * n_arms) ** 2) * 1.6)
+
         v_c = v_circ(r)
         sig = 0.09 * v_c                      # cold-ish disk, Toomre Q ~ 1.5
 
@@ -1097,7 +1324,7 @@ def preset_galaxy_merger(rng):
         t = np.clip(r / r_max, 0.0, 1.0)[:, None]
         base = np.array(tint)[None, :]
         core = np.array([1.0, 0.95, 0.90])[None, :]
-        shade = rng.uniform(0.65, 1.45, n_disk)[:, None]
+        shade = rng.uniform(0.65, 1.45, n_disk)[:, None] * (1.0 + 0.9 * arm)[:, None]
         disk_c.append((core * (1.0 - t) ** 9 * 0.9 + base * (0.85 + 0.45 * t))
                       * shade * 0.85)
 
@@ -1112,7 +1339,11 @@ def preset_galaxy_merger(rng):
 
     return Scene("Galaxy Merger", P, V, M, S, C, R,
                  n_src=n_src, gconst=G, dt=0.04, substeps=2,
-                 cam_dist=285.0, cam_pitch=1.30, cam_yaw=0.0, gain=1.0)
+                 cam_dist=285.0, cam_pitch=1.30, cam_yaw=0.0, gain=1.0,
+                 # only the disks become gas; the massive component here is
+                 # dark matter and a halo drawn as a glowing cloud would be
+                 # exactly the wrong picture of it
+                 gas="screen", gas_lo=n_src)
 
 
 # ---------------------------------------------------------------------------
@@ -1128,23 +1359,36 @@ def preset_black_hole(rng):
     in, gets stretched into a stream at pericentre, and that stream is what
     becomes the disk.
 
-    One honest caveat about the star.  Around a hole this small a real star is
-    torn apart tens of thousands of r_s out, far outside anywhere the lensing
-    is visible -- which is exactly why observed tidal disruptions are events
-    around supermassive holes, and why real 10-solar-mass holes (Cygnus X-1
-    and the rest of the X-ray binaries) get their disks from a companion
-    feeding them rather than from one swallowed star.  To put the disruption
-    somewhere you can actually watch it against the photon ring, the star here
-    is deliberately compact for its mass.  "Sustain disk" models the
-    companion-fed case, and is what stops the disk ever emptying out.
+    One honest caveat about the star.  It is drawn several times the size of
+    the hole, which is the right way round -- the hole is 30 km across and any
+    real star dwarfs it -- but nowhere near the true ratio: a sun-like star
+    next to a 10-solar-mass hole is some twenty thousand r_s across, so at this
+    zoom it would fill the sky and the photon ring would be a speck.  The same
+    scale problem is why a real star that size is torn apart tens of thousands
+    of r_s out, far outside anywhere the lensing is visible, which in turn is
+    why observed tidal disruptions are events around supermassive holes, and
+    why real 10-solar-mass holes -- Cygnus X-1 and the rest of the X-ray
+    binaries -- get their disks from a companion feeding them rather than from
+    one swallowed star.  So the star here is deliberately compact for its mass:
+    big enough on screen to read as the larger body, small enough that the
+    disruption happens where you can watch it against the ring.  "Sustain
+    disk" models the companion-fed case, and stops the disk emptying out.
     """
     G = 1.0
     rs = 1.0
     gm = 0.5 * rs            # c = 1 and r_s = 2GM, so GM = r_s / 2
 
-    star_n = 5000            # particles per star -- a denser stream reads
-                             # as a stream rather than a spray
-    star_slots = 3           # stars that can be on the board at once
+    # A stretched stream is a one-dimensional object drawn out over a hundred
+    # r_s, so it needs far more particles than a ball does to stay continuous
+    # rather than reading as a scatter of specks.  Only a coarse subset of them
+    # carries the star's mass, though: self-gravity is the one O(N^2) term in
+    # the whole simulation, and resolving the star's potential needs a few
+    # thousand bodies where drawing its stream needs tens of thousands.  The
+    # rest follow the same distribution function as massless tracers, so they
+    # trace exactly the orbits the massive ones do, at O(N) instead.
+    star_n = 36000           # particles drawn per star
+    star_src = 900           # of those, the ones that carry its mass
+    star_slots = 2           # stars that can be on the board at once
 
     P = [[0.0, 0.0, 0.0]]
     V = [[0.0, 0.0, 0.0]]
@@ -1166,48 +1410,86 @@ def preset_black_hole(rng):
     R.extend([0.030] * pool)
 
     sc = Scene("Black Hole", P, V, M, S, C, R,
-               n_src=1, n_dynamic=1, gconst=G, dt=0.22, substeps=3, pw_rs=rs,
+               n_src=1, n_dynamic=1, gconst=G, dt=0.16, substeps=4, pw_rs=rs,
                bh=True, disk_in=3.0, disk_out=26.0, recycle=None,
-               cam_dist=34.0, cam_pitch=0.075, cam_yaw=0.6,
-               fov=42.0, gain=0.8, world_rs=rs, kill_drift=False)
+               cam_dist=52.0, cam_pitch=0.30, cam_yaw=0.6,
+               fov=42.0, gain=0.075, world_rs=rs, kill_drift=False,
+               gas="volume", gas_half=(GAS_RX, GAS_RY), gas_lo=1)
     sc.star_n = star_n
+    sc.star_src = star_src
     sc.star_slots = star_slots
     sc.star_cfg = {
         "m_star": 1.0e-3,
-        "r_star": 2.5,       # outer radius in r_s -- see the docstring
-        "r_apo": 65.0,       # spawn radius: apocentre of the infall orbit
-        "r_peri": 12.0,      # pericentre, inside the tidal radius
-        "soft": 0.06,
+        "r_star": 7.0,       # outer radius in r_s -- see the docstring.  Well
+                             # clear of the 2.6 r_s shadow, so the star reads
+                             # as the larger of the two bodies on screen, which
+                             # is what it is: the hole here is 30 km across.
+        "r_apo": 150.0,      # apocentre of the infall orbit
+        "r_start": 96.0,     # where it is actually dropped -- see make_star
+        "r_peri": 17.0,      # pericentre, deep inside the tidal radius
+        "soft": 0.05,
+        # softening for the massive subset: about the spacing between them in
+        # the star's core, so they model a smooth potential rather than
+        # scattering off one another
+        "soft_src": 0.30,
         "gm": gm,
         "rs": rs,
     }
     return sc
 
 
-def make_star(cfg, n, rng, phi=0.5 * math.pi):
+def make_star(cfg, n, rng, phi=0.5 * math.pi, n_src=None):
     """Positions and velocities for one star: a self-consistent Plummer ball
-    (so it does not breathe or evaporate on its own) placed at apocentre of a
-    bound eccentric orbit, in the y = 0 plane.
+    (so it does not breathe or evaporate on its own) placed on the inbound leg
+    of a bound eccentric orbit, in the y = 0 plane.
 
     Keeping the orbit in the equatorial plane matters: all the debris then
     inherits that plane, so the disk it forms lands where the ray marcher's
-    own equatorial disk lives, and the two read as one structure."""
+    own equatorial disk lives, and the two read as one structure.
+
+    Dropped part-way down the inbound leg rather than at apocentre.  The orbit
+    is the same orbit either way -- same a, same e, same pericentre -- but the
+    slow crawl through apocentre is where nearly all of the period goes, and
+    starting below it means the stretch and the shredding begin within seconds
+    instead of a minute of watching a dot drift.  The radial and tangential
+    velocity components come straight from vis-viva plus the orbit's angular
+    momentum, so the starting state sits exactly on the intended ellipse."""
     m_star, r_star = cfg["m_star"], cfg["r_star"]
     r_apo, r_peri, gm = cfg["r_apo"], cfg["r_peri"], cfg["gm"]
 
-    p, v = plummer_sphere(n, m_star, r_star * 0.5, 1.0, rng, rcut=2.0)
+    # The ball is built cold and centrally concentrated: a dense core survives
+    # a little longer than its envelope, which is what puts the kink in the
+    # stream and keeps the two tidal tails clearly separate rather than letting
+    # the whole thing smear into one even fan.
+    p, v = plummer_sphere(n, m_star, r_star * 0.42, 1.0, rng, rcut=2.4)
 
     a_orb = 0.5 * (r_apo + r_peri)
-    v_apo = math.sqrt(max(gm * (2.0 / r_apo - 1.0 / a_orb), 0.0))
+    ecc = (r_apo - r_peri) / (r_apo + r_peri)
+    r0 = float(np.clip(cfg.get("r_start", r_apo), r_peri * 1.6, r_apo))
+    v0 = math.sqrt(max(gm * (2.0 / r0 - 1.0 / a_orb), 0.0))
+    l_orb = math.sqrt(max(gm * a_orb * (1.0 - ecc * ecc), 0.0))
+    v_tan = l_orb / r0
+    v_rad = -math.sqrt(max(v0 * v0 - v_tan * v_tan, 0.0))   # inbound
+
     # placed at azimuth phi and moving so its angular momentum points along -y,
     # the same sense the ray-marched disk turns in, so the disk it eventually
     # forms rotates the right way
     sp, cp = math.sin(phi), math.cos(phi)
-    p = p + np.array([r_apo * sp, 0.0, r_apo * cp])
-    v = v + np.array([-v_apo * cp, 0.0, v_apo * sp])
+    rhat = np.array([sp, 0.0, cp])
+    that = np.array([-cp, 0.0, sp])
+    p = p + rhat * r0
+    v = v + that * v_tan + rhat * v_rad
 
-    m = np.full(n, m_star / n, dtype=np.float32)
+    # The first n_src are a fair random subset of the same draw -- the sample
+    # is i.i.d., so taking a prefix of it is taking a smaller Plummer sphere of
+    # the same shape -- and they carry the whole mass between them.  Keeping
+    # them contiguous is what lets the integrator take the source set as a
+    # range and skip the rest of the O(N^2) inner loop entirely.
+    n_src = max(1, min(int(n_src or n), n))
+    m = np.zeros(n, dtype=np.float32)
+    m[:n_src] = m_star / n_src
     s = np.full(n, cfg["soft"], dtype=np.float32)
+    s[:n_src] = cfg.get("soft_src", cfg["soft"])
     return (np.ascontiguousarray(p, dtype=np.float32),
             np.ascontiguousarray(v, dtype=np.float32), m, s)
 
@@ -1360,17 +1642,39 @@ vec3 skyColor(vec3 d) {
 }
 """
 
+# Point sprites are drawn into TWO colour attachments: the usual additive HDR
+# colour, and a (weight * camera distance, weight) pair.  Dividing one by the
+# other in a later pass recovers the brightness-weighted mean distance of
+# whatever landed in that texel, which is what lets the lensing pass put a
+# particle's light where the bent ray actually crosses it instead of assuming
+# every particle sits at infinity.  See LENS_PICKUP_NOTE.
 PARTICLE_VS = """
 #version 330
 in vec3 in_pos;
 in vec4 in_attr;          // rgb tint, w = world-space radius
 uniform mat4 u_viewProj;
 uniform vec3 u_camPos;
+uniform vec3 u_bhPos;
 uniform float u_pxScale;  // 0.5 * viewport_height / tan(fovy/2)
 uniform float u_gain;
+uniform float u_nearR;    // world-space radius of the near-field shell
+uniform int u_layer;      // 0 = everything, 1 = near field only, 2 = far only
 out vec3 v_col;
 out float v_fade;
+out float v_dist;
 void main() {
+    if (u_layer != 0) {
+        bool isNear = distance(in_pos, u_bhPos) <= u_nearR;
+        if ((u_layer == 1) != isNear) {
+            // off the far clip plane: the sprite is another layer's business
+            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+            gl_PointSize = 0.0;
+            v_col = vec3(0.0);
+            v_fade = 0.0;
+            v_dist = 0.0;
+            return;
+        }
+    }
     gl_Position = u_viewProj * vec4(in_pos, 1.0);
     float d = max(distance(in_pos, u_camPos), 1e-4);
     float px = in_attr.w * u_pxScale / d;
@@ -1381,6 +1685,7 @@ void main() {
     gl_PointSize = clamp(px * 2.0, 1.0, 96.0);
     v_fade = fade * u_gain * (in_attr.w > 0.0 ? 1.0 : 0.0);
     v_col = in_attr.rgb;
+    v_dist = d;
 }
 """
 
@@ -1388,13 +1693,19 @@ PARTICLE_FS = """
 #version 330
 in vec3 v_col;
 in float v_fade;
-out vec4 f_color;
+in float v_dist;
+layout(location = 0) out vec4 f_color;
+layout(location = 1) out vec4 f_depth;
 void main() {
     vec2 q = gl_PointCoord * 2.0 - 1.0;
     float r2 = dot(q, q);
     if (r2 > 1.0) discard;
-    float g = exp(-r2 * 4.2) - 0.0149;      // gaussian core, zero at the rim
-    f_color = vec4(v_col * g * v_fade, 1.0);
+    // A wide gaussian, not a tight one: debris is drawn as overlapping soft
+    // blobs so a stream reads as a filament instead of a scatter of specks.
+    float g = exp(-r2 * 2.6) - 0.0743;      // gaussian core, zero at the rim
+    float w = g * v_fade;
+    f_color = vec4(v_col * w, w);
+    f_depth = vec4(w * v_dist, w, 0.0, 0.0);
 }
 """
 
@@ -1406,19 +1717,25 @@ ORBIT_VS = """
 in vec3 in_pos;
 in vec3 in_col;
 uniform mat4 u_viewProj;
+uniform vec3 u_camPos;
 out vec3 v_col;
+out float v_dist;
 void main() {
     gl_Position = u_viewProj * vec4(in_pos, 1.0);
     v_col = in_col;
+    v_dist = max(distance(in_pos, u_camPos), 1e-4);
 }
 """
 
 ORBIT_FS = """
 #version 330
 in vec3 v_col;
-out vec4 f_color;
+in float v_dist;
+layout(location = 0) out vec4 f_color;
+layout(location = 1) out vec4 f_depth;
 void main() {
     f_color = vec4(v_col, 1.0);
+    f_depth = vec4(v_dist, 1.0, 0.0, 0.0);
 }
 """
 
@@ -1428,14 +1745,82 @@ FLAT_FS = """
 in vec2 v_uv;
 out vec4 f_color;
 uniform sampler2D u_scene;
+uniform sampler2D u_near;
 uniform vec3 u_camRight, u_camUp, u_camFwd;
+uniform vec3 u_camPos, u_bhPos;
 uniform float u_tanHalf, u_aspect;
+uniform float u_rs, u_diskIn;
+uniform sampler3D u_gas;
+uniform vec2 u_gasHalf;
+uniform vec3 u_gasOff;
+uniform float u_gasBright, u_gasOpacity;
+uniform int u_gasMode;
 __COMMON__
+
+vec3 diskColor(float t) {
+    t = clamp(t, 0.0, 1.6);
+    vec3 c;
+    if (t < 0.5) c = mix(vec3(0.55, 0.11, 0.02), vec3(1.00, 0.42, 0.06), t / 0.5);
+    else if (t < 1.0) c = mix(vec3(1.00, 0.42, 0.06), vec3(1.00, 0.86, 0.54), (t - 0.5) / 0.5);
+    else c = mix(vec3(1.00, 0.86, 0.54), vec3(0.86, 0.93, 1.10), (t - 1.0) / 0.6);
+    return c;
+}
+
 void main() {
     vec2 ndc = v_uv * 2.0 - 1.0;
     vec3 rd = normalize(u_camFwd + u_camRight * ndc.x * u_tanHalf * u_aspect
                                  + u_camUp * ndc.y * u_tanHalf);
-    f_color = vec4(skyColor(rd) + texture(u_scene, v_uv).rgb, 1.0);
+    vec3 parts = texture(u_scene, v_uv).rgb + texture(u_near, v_uv).rgb;
+    vec3 col = skyColor(rd) + parts;
+
+    // With lensing off the light travels in a straight line, but the debris is
+    // still a volume and still has to be integrated -- otherwise turning the
+    // lensing off makes the gas disappear rather than un-bend.  Entry and exit
+    // come from a slab test against the grid, so the march is the same length
+    // whatever the camera distance.
+    if (u_gasBright > 0.0) {
+        vec3 ro = (u_camPos - u_bhPos) / u_rs - u_gasOff;
+        vec3 bmax = vec3(u_gasHalf.x, u_gasHalf.y, u_gasHalf.x);
+        vec3 inv = 1.0 / rd;
+        vec3 ta = (-bmax - ro) * inv, tb = (bmax - ro) * inv;
+        vec3 lo = min(ta, tb), hi = max(ta, tb);
+        float t0 = max(max(max(lo.x, lo.y), lo.z), 0.0);
+        float t1 = min(min(hi.x, hi.y), hi.z);
+        if (t1 > t0) {
+            float dt = (t1 - t0) / 160.0;
+            float trans = 1.0;
+            for (int i = 0; i < 160; i++) {
+                vec3 q = ro + rd * (t0 + (float(i) + 0.5) * dt);
+                vec3 gc = vec3(q.x / u_gasHalf.x, q.y / u_gasHalf.y,
+                               q.z / u_gasHalf.x) * 0.5 + 0.5;
+                // faded across the outermost cells, exactly as the lensing
+                // pass does it: the grid must never show itself as a straight
+                // edge ruled across the sky
+                vec3 e = smoothstep(vec3(1.0), vec3(0.88), abs(gc * 2.0 - 1.0));
+                float g = texture(u_gas, clamp(gc, 0.0, 1.0)).r * e.x * e.y * e.z;
+                if (g > 0.004) {
+                    vec3 gcol;
+                    if (u_gasMode == 1) {
+                        gcol = mix(vec3(0.12, 0.16, 0.42), vec3(0.72, 0.34, 0.52),
+                                   smoothstep(0.02, 0.30, g));
+                        gcol = mix(gcol, vec3(1.00, 0.90, 0.74),
+                                   smoothstep(0.28, 0.75, g));
+                    } else {
+                        gcol = diskColor(
+                            pow(clamp(u_diskIn / max(length(q), 1.2), 0.02, 2.0), 0.75)
+                            + 0.92 * g);
+                    }
+                    // Emission and absorption both from the real density, so
+                    // this is an ordinary emitting, self-absorbing gas.
+                    float rho = g * g;
+                    col += trans * gcol * rho * u_gasBright * dt;
+                    trans *= exp(-u_gasOpacity * rho * dt);
+                }
+                if (trans < 0.004) break;
+            }
+        }
+    }
+    f_color = vec4(col, 1.0);
 }
 """
 
@@ -1445,7 +1830,10 @@ GARGANTUA_FS = """
 in vec2 v_uv;
 out vec4 f_color;
 
-uniform sampler2D u_scene;
+uniform sampler2D u_scene;   // far-field particles: colour
+uniform sampler2D u_sceneD;  // far-field particles: (w*dist, w)
+uniform sampler2D u_near;    // near-field particles: colour
+uniform sampler2D u_nearD;   // near-field particles: (w*dist, w)
 uniform mat4 u_viewProj;
 uniform vec3 u_camPos;
 uniform vec3 u_camRight, u_camUp, u_camFwd;
@@ -1460,8 +1848,43 @@ uniform float u_spin;        // +-1, sense of disk rotation
 uniform float u_jetBright;   // 0 = no jet
 uniform float u_jetLen;      // how far the beams reach, in r_s
 uniform float u_jetRad;      // beam radius at the base
+uniform float u_jetTwist;    // strength of the helical striping
+uniform float u_nearR;       // near-field shell radius, in r_s
+uniform float u_diskH;       // disk scale-height multiplier
+uniform sampler3D u_gas;     // N-body debris as a density field
+uniform vec2 u_gasHalf;      // its half-extents in r_s: (x and z, y)
+uniform vec3 u_gasOff;       // grid centre, relative to the hole, in r_s
+uniform float u_gasBright;   // 0 = no gas (particles are being drawn instead)
+uniform float u_gasOpacity;
+uniform float u_gasStep;     // march step inside the grid: a couple of cells
+uniform int u_gasMode;       // 0 = accretion flow, 1 = a cool nebula
 
 __COMMON__
+
+// Offset from the hole, in r_s, to a coordinate in the debris density grid.
+vec3 gasCoord(vec3 w) {
+    vec3 q = w - u_gasOff;
+    return vec3(q.x / u_gasHalf.x, q.y / u_gasHalf.y, q.z / u_gasHalf.x) * 0.5 + 0.5;
+}
+
+// Density at a point, faded to nothing across the outermost tenth of the grid.
+// Without that fade the box is visible as a straight edge ruled across the sky
+// wherever material reaches a face, which is not a thing space does.
+float gasAt(vec3 gc) {
+    if (any(lessThan(gc, vec3(0.0))) || any(greaterThan(gc, vec3(1.0)))) return 0.0;
+    vec3 e = smoothstep(vec3(1.0), vec3(0.88), abs(gc * 2.0 - 1.0));
+    return texture(u_gas, gc).r * e.x * e.y * e.z;
+}
+
+// Colour of the gas.  Mode 0 is an accretion flow, taking its temperature from
+// depth in the potential -- the shock and compression heating that turns cool
+// debris into a glowing disk -- plus a density term standing in for a body
+// still hot and opaque in its own right.  Without that second term an intact
+// star reads as cold as the outermost debris, because it is just as far out,
+// and comes out blood red when it should be a warm white.  Mode 1 is a cold
+// cloud lit from within: nothing is heating it from a centre, so its colour
+// follows density alone.
+vec3 gasColor(float g, float r);
 
 // Cheap blackbody-ish ramp, t = 0 (cool outer disk) .. 1+ (inner, doppler boosted)
 vec3 diskColor(float t) {
@@ -1471,6 +1894,16 @@ vec3 diskColor(float t) {
     else if (t < 1.0) c = mix(vec3(1.00, 0.42, 0.06), vec3(1.00, 0.86, 0.54), (t - 0.5) / 0.5);
     else c = mix(vec3(1.00, 0.86, 0.54), vec3(0.86, 0.93, 1.10), (t - 1.0) / 0.6);
     return c;
+}
+
+vec3 gasColor(float g, float r) {
+    if (u_gasMode == 1) {
+        vec3 c = mix(vec3(0.12, 0.16, 0.42), vec3(0.72, 0.34, 0.52),
+                     smoothstep(0.02, 0.30, g));
+        return mix(c, vec3(1.00, 0.90, 0.74), smoothstep(0.28, 0.75, g));
+    }
+    float t = pow(clamp(u_diskIn / max(r, 1.2), 0.02, 2.0), 0.75) + 0.92 * g;
+    return diskColor(t);
 }
 
 void main() {
@@ -1496,7 +1929,14 @@ void main() {
     // empty space one small step at a time.  Without this, pulling the camera
     // back a few hundred r_s starves the integrator before it ever reaches the
     // photon sphere and the whole lensing effect silently disappears.
-    float enterR = max(u_diskOut * 3.0, 60.0);
+    // How far out there is anything to find.  Never skipped past the
+    // near-field shell, because the particle pickup inside the march is the
+    // only thing that places that material correctly -- and never past the
+    // debris grid either, or a camera pulled back beyond it would see the
+    // skip's own sphere as a hard arc cut through the gas.
+    float gasReach = 1.05 * max(u_gasHalf.x, u_gasHalf.y) + length(u_gasOff);
+    float enterR = max(max(u_diskOut * 3.0, 60.0), u_nearR * 1.05);
+    if (u_gasBright > 0.0) enterR = max(enterR, gasReach);
     int steps = u_steps;
     if (dot(p, p) > enterR * enterR) {
         float A = dot(v, v);
@@ -1512,11 +1952,35 @@ void main() {
     }
 
     float r0 = length(p);
-    float escR = max(u_diskOut * 1.6, r0 * 1.15 + 6.0);
+    // marched out past the near-field shell even when the camera is closer in,
+    // so debris behind the hole is still picked up on the way out
+    float escR = max(max(u_diskOut * 1.6, r0 * 1.15 + 6.0), u_nearR * 1.08);
+    // far enough out for the beams to run off the edge of the frame rather
+    // than stopping wherever the integration happened to give up
+    if (u_jetBright > 0.0) escR = max(escR, u_jetLen * 1.45);
+    if (u_gasBright > 0.0) escR = max(escR, gasReach);
+
+    // Far-field particles in FRONT of the hole are still on the straight part
+    // of the ray, so they belong exactly where the flat projection drew them.
+    // Split front from back by the recorded distance of each texel rather than
+    // by which particle went where, so a texel holding both is handled too.
+    float camR = distance(u_camPos, u_bhPos);
+    vec4 fd = texture(u_sceneD, v_uv);
+    float frontMask = 1.0 - smoothstep(camR * 0.96, camR * 1.04,
+                                       fd.x / max(fd.y, 1e-5));
+    vec3 frontCol = texture(u_scene, v_uv).rgb * frontMask * step(1e-5, fd.y);
 
     vec3 col = vec3(0.0);
     float trans = 1.0;
     bool captured = false;
+
+    // A fixed fraction of the first step, chosen per pixel.  Marching a smooth
+    // emissive volume with a step size that every pixel shares lays down
+    // visible contour rings through it; offsetting the phase decorrelates
+    // neighbouring pixels and turns those rings into fine noise, which the
+    // bloom then smooths away.  Keyed off the pixel and not the clock, so it
+    // is stable from frame to frame rather than crawling.
+    float jitter = hash12(gl_FragCoord.xy);
 
     vec3 acc = -1.5 * h2 * p / pow(dot(p, p), 2.5);
 
@@ -1526,8 +1990,28 @@ void main() {
         if (r > escR && dot(p, v) > 0.0) break;
         if (trans < 0.004) break;
 
-        float dt = clamp(0.11 * (r - 0.92), 0.02, 1.3);
-        if (r < u_diskOut * 1.3) dt = min(dt, max(0.45 * abs(p.y), 0.035));
+        // The cap used to be 1.3 everywhere, which is far finer than empty
+        // space needs and is what made a long beam or a wide debris field run
+        // the step budget out before the ray got there.
+        float dt = clamp(0.11 * (r - 0.92), 0.02, 3.5);
+        // Enough to resolve the disk's scale height.  The old clamp here drove
+        // the step down to 0.035 anywhere near the midplane, because a plane
+        // has to be caught exactly; a slab only has to be sampled, and a few
+        // samples across its thickness is plenty.
+        if (r < u_diskOut * 1.3)
+            dt = min(dt, max(0.45 * u_diskH * (0.32 + 0.052 * r), 0.05));
+        // inside the beams, step finely enough to resolve their structure
+        if (u_jetBright > 0.0 && abs(p.y) < u_jetLen
+            && length(p.xz) < u_jetRad * 3.0) dt = min(dt, 0.40);
+        // and finely enough not to step over the debris grid's smoothing
+        // length, which after three blur passes is a couple of cells.  Scaled
+        // to the grid rather than fixed: the grid stretches to reach wherever
+        // a star is dropped from, and a step fixed at the size a compact one
+        // wants runs the budget out long before the ray gets across a wide one
+        vec3 gp = p - u_gasOff;
+        if (u_gasBright > 0.0 && abs(gp.y) < u_gasHalf.y
+            && max(abs(gp.x), abs(gp.z)) < u_gasHalf.x) dt = min(dt, u_gasStep);
+        if (i == 0) dt *= 0.25 + 0.75 * jitter;
 
         vec3 pPrev = p;
         p += v * dt + 0.5 * acc * dt * dt;
@@ -1535,43 +2019,152 @@ void main() {
         v += 0.5 * (acc + accNew) * dt;
         acc = accNew;
 
+        // Sampled at a per-pixel point within the step rather than always at
+        // its middle.  Every volume below -- jet, disk, debris -- is sampled
+        // here, and sampling them all at the same phase across a whole screen
+        // of rays lays down contour rings through them; scattering the phase
+        // turns those into fine noise that the bloom then smooths away.
+        vec3 mid = mix(pPrev, p, 0.25 + 0.5 * jitter);
+
         // --- polar jets ---------------------------------------------------
         // Accumulated as a volume along the ray rather than drawn as
         // particles: a beam made of points stays a dotted line no matter how
         // many you throw at it, where an emissive volume actually glows -- and
         // being integrated inside the geodesic march, it gets lensed with
         // everything else.
+        //
+        // Shaped the way a real jet is shaped rather than as a flashlight
+        // cone.  A magnetically collimated beam barely opens out over its
+        // whole visible length, carries a hot near-white spine down the axis,
+        // and takes its texture from the field wound helically around it plus
+        // the knots that advect outward along it.  The wide smooth cone this
+        // replaces read as a spotlight; this reads as a beam.
         if (u_jetBright > 0.0) {
-            vec3 mid = mix(pPrev, p, 0.5);
             float ay = abs(mid.y);
-            if (ay > 1.1 && ay < u_jetLen) {
+            if (ay > 0.35 && ay < u_jetLen * 1.35) {
                 float h = ay / u_jetLen;
-                float cone = u_jetRad * (0.35 + 3.20 * h);   // widens with height
+                float cone = u_jetRad * (0.62 + 0.75 * h);   // barely flares
                 float rxz = length(mid.xz);
-                if (rxz < cone) {
-                    float prof = 1.0 - rxz / cone;
-                    float turb = fbm(vec3(mid.xz * 0.9, ay * 0.22 - u_time * 0.5), 3);
-                    vec3 jcol = mix(vec3(0.45, 0.70, 1.35), vec3(1.00, 0.72, 1.20), turb);
-                    float glow = prof * prof * exp(-h * 1.35) * (0.50 + 0.85 * turb);
+                if (rxz < cone * 2.4) {
+                    float q = rxz / cone;
+
+                    // the pattern climbs the beam with time, so the jet
+                    // visibly streams outward instead of shimmering in place
+                    float turb = fbm(vec3(mid.xz * 1.25,
+                                          ay * 0.33 - u_time * 1.30), 4);
+                    // twist that unwinds with height: this is what gives the
+                    // beam running filaments instead of a smooth wash
+                    float tw = 2.0 * atan(mid.z, mid.x) - ay * 0.42 + u_time * 0.55;
+                    float helix = 1.0 - u_jetTwist * (0.5 - 0.5 * cos(tw + 5.0 * turb));
+
+                    float spine  = exp(-q * q * 4.0);             // hot axis
+                    float sheath = 0.50 * exp(-q * q * 1.15) * helix;
+                    float prof = (spine + sheath) * (0.35 + 1.05 * turb);
+
+                    // a bright knot at the launch point, fading fast: the base
+                    // of a jet is the brightest part of it
+                    prof += 0.55 * spine * exp(-(ay - 1.4) * (ay - 1.4) * 0.10);
+
+                    // Surface brightness falls as the beam widens and cools,
+                    // and both ends are ramped rather than cut.  A beam that
+                    // simply stops at a radius has a flat end hanging in
+                    // space, which is the one thing that reads instantly as a
+                    // drawn object rather than as something lit.
+                    float ends = smoothstep(0.35, 1.10, ay)
+                               * (1.0 - smoothstep(0.72, 1.32, h));
+                    float glow = 0.52 * prof * ends * exp(-h * 1.45)
+                               / (0.55 + 0.95 * h);
+                    vec3 jcol = mix(vec3(0.36, 0.58, 1.30),
+                                    vec3(0.96, 0.98, 1.20),
+                                    clamp(spine * 1.25, 0.0, 1.0));
                     col += trans * jcol * glow * u_jetBright * dt;
                 }
             }
         }
 
-        // --- equatorial disk crossing -----------------------------------
-        if (pPrev.y * p.y < 0.0) {
-            float w = pPrev.y / (pPrev.y - p.y);
-            vec3 x = mix(pPrev, p, w);
+        // --- near-field particles, picked up along the geodesic ------------
+        // LENS_PICKUP_NOTE.  The N-body points are drawn flat, by the ordinary
+        // projection, into a buffer that also records how far each texel's
+        // light was from the camera.  A bent ray then finds a particle by
+        // matching both screen position and distance: every point in space has
+        // a unique (pixel, distance) pair, so that buffer is a usable stand-in
+        // for the particle field itself, and the light gets deposited where
+        // the ray really crosses it.
+        //
+        // This is what stops the orbiting debris being lensed into a different
+        // place from the disk it belongs to.  Sampling the buffer by the
+        // escaping ray's direction instead -- the obvious thing, and what was
+        // here before -- quietly assumes every particle is infinitely far
+        // away, which is badly wrong for material a few r_s from the hole and
+        // throws its image off into an arc of its own.
+        if (length(mid) < u_nearR) {
+            vec3 wmid = u_bhPos + mid * u_rs;
+            vec4 pc = u_viewProj * vec4(wmid, 1.0);
+            if (pc.w > 1e-5) {
+                vec2 uv = pc.xy / pc.w * 0.5 + 0.5;
+                if (all(greaterThanEqual(uv, vec2(0.0))) &&
+                    all(lessThanEqual(uv, vec2(1.0)))) {
+                    vec4 nd = texture(u_nearD, uv);
+                    if (nd.y > 1e-5) {
+                        float dp = nd.x / nd.y;
+                        float d0 = distance(u_camPos, u_bhPos + pPrev * u_rs);
+                        float d1 = distance(u_camPos, u_bhPos + p * u_rs);
+                        // half-open, so consecutive steps tile the ray exactly
+                        // once -- except where the ray turns back on itself,
+                        // and a second pickup there is a second image
+                        if (dp >= min(d0, d1) && dp < max(d0, d1)) {
+                            col += trans * texture(u_near, uv).rgb;
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- the disk, as a slab with thickness --------------------------
+        // It used to be a mathematical plane, caught by testing whether the
+        // step crossed y = 0.  That is why it looked paper-thin and searingly
+        // bright edge-on: a plane has no edge to see, so all of its light
+        // arrived in a single sample and collapsed onto one line of pixels.
+        // Now it is integrated as a volume with a scale height that flares
+        // outward, so from the side it is a band of glowing gas of some
+        // definite depth, and the light is spread through that depth.  The
+        // 1/H below keeps the face-on brightness the same as the old surface
+        // model, so only the edge-on view changes.
+        {
+            vec3 x = mid;
             float rr = length(x.xz);
-            if (rr > u_diskIn && rr < u_diskOut) {
+            float hh = u_diskH * (0.32 + 0.052 * rr);
+            float vprof = exp(-(x.y * x.y) / (hh * hh));
+            if (rr > u_diskIn && rr < u_diskOut && vprof > 0.004) {
                 float tn = (rr - u_diskIn) / (u_diskOut - u_diskIn);
 
-                // differential rotation: sample the noise field in the frame
-                // co-rotating with the local Keplerian angular velocity
-                float dphi = u_spin * u_time * 0.7071 * pow(rr, -1.5);
-                float cs = cos(dphi), sn = sin(dphi);
-                vec2 q = vec2(cs * x.x - sn * x.z, sn * x.x + cs * x.z);
-                float dens = fbm(vec3(q * 0.42, log(rr) * 2.2), 4);
+                // Differential rotation: the noise field is sampled in the
+                // frame co-rotating with the local Keplerian angular velocity,
+                // so the lanes shear the way real disk material does.
+                //
+                // Winding it straight off the clock does not work for long.
+                // The inner disk laps the outer one, the pattern is dragged
+                // into ever tighter spirals, and within a few hundred time
+                // units those spirals are finer than a pixel and alias into
+                // concentric rings.  So the shear is run on two half-cycle
+                // offset copies and cross-faded between them: each copy is
+                // never advected more than half a period before it is reset
+                // under cover of the other, which keeps the winding bounded
+                // while the disk still visibly turns.
+                float per = 45.0;
+                float ta = fract(u_time / per);
+                float tb = fract(u_time / per + 0.5);
+                float om = u_spin * 0.7071 * pow(rr, -1.5);
+                float wa = 1.0 - abs(2.0 * ta - 1.0);
+                vec3 nz = vec3(0.0, 0.0, log(rr) * 2.2);
+                float dens = 0.0;
+                for (int k = 0; k < 2; k++) {
+                    float dphi = om * ((k == 0 ? ta : tb) - 0.5) * per;
+                    float cs = cos(dphi), sn = sin(dphi);
+                    vec2 q = vec2(cs * x.x - sn * x.z, sn * x.x + cs * x.z);
+                    nz.xy = q * 0.42;
+                    dens += fbm(nz, 3) * (k == 0 ? wa : 1.0 - wa);
+                }
                 dens = pow(clamp(dens * 1.7 - 0.32, 0.0, 1.0), 1.25);
                 float lanes = 0.40 + 0.60 * dens;
 
@@ -1591,10 +2184,40 @@ void main() {
                 float temp = pow(u_diskIn / rr, 0.75) * shift;
                 vec3 emit = diskColor(temp) * emis * lanes * radial * boost * u_diskBright;
 
-                col += trans * emit;
+                float seg = vprof * dt / (1.772 * hh);
+                col += trans * emit * seg;
                 // opacity has to fade out with brightness too, or a disk turned
                 // down to nothing still casts a dark band across the lensed sky
-                trans *= exp(-2.4 * dens * radial * clamp(u_diskBright, 0.0, 1.0));
+                trans *= exp(-2.4 * dens * radial * seg
+                             * clamp(u_diskBright, 0.0, 1.0));
+            }
+        }
+
+        // --- the N-body debris, as gas -----------------------------------
+        // The same medium everywhere: the star still falling in, the stream it
+        // is drawn out into, and the ring it settles into are one density
+        // field with one emission model, so they run into each other instead
+        // of meeting at a seam.  Temperature comes from depth in the potential
+        // and uses the disk's own colour ramp, which is what makes the debris
+        // and the drawn disk read as the same substance.
+        if (u_gasBright > 0.0) {
+            {
+                float g = gasAt(gasCoord(mid));
+                if (g > 0.004) {
+                    // Emission and absorption both from the real density, so
+                    // this is an ordinary emitting, self-absorbing gas: thick
+                    // material glows at a fixed surface brightness and thin
+                    // material is fainter in proportion to how much of it the
+                    // ray passes through.  Taking emission from the encoded
+                    // square root instead is tempting, because it flatters the
+                    // faint stuff -- but a ray crossing a hundred r_s of
+                    // near-vacuum then accumulates as much light as one
+                    // crossing the disk, and the whole frame fogs over.
+                    float rho = g * g;
+                    col += trans * gasColor(g, length(mid - u_gasOff))
+                                 * rho * u_gasBright * dt;
+                    trans *= exp(-u_gasOpacity * rho * dt);
+                }
             }
         }
     }
@@ -1609,13 +2232,22 @@ void main() {
         // simulated disk and the star field smear into Einstein arcs.
         vec4 clip = u_viewProj * vec4(dir, 0.0);
         if (clip.w > 1e-5) {
-            vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+            vec2 uv = clamp(clip.xy / clip.w * 0.5 + 0.5, 0.0, 1.0);
             vec2 e = smoothstep(vec2(0.0), vec2(0.012), uv)
                    * (1.0 - smoothstep(vec2(0.988), vec2(1.0), uv));
-            sky += texture(u_scene, clamp(uv, 0.0, 1.0)).rgb * e.x * e.y;
+            // only the material genuinely behind the hole: those points are
+            // far enough away that the escaping direction is the right lookup,
+            // which is the one case the at-infinity assumption actually holds
+            vec4 bd = texture(u_sceneD, uv);
+            float backMask = smoothstep(camR * 0.96, camR * 1.04,
+                                        bd.x / max(bd.y, 1e-5));
+            sky += texture(u_scene, uv).rgb * e.x * e.y * backMask;
         }
         col += trans * sky;
     }
+
+    // added last and unattenuated: this layer is nearer than everything above
+    col += frontCol;
 
     f_color = vec4(col, 1.0);
 }
@@ -1645,7 +2277,12 @@ void main() {
 BLUR_FS = """
 #version 330
 in vec2 v_uv;
-out vec4 f_color;
+// Two outputs because this also blurs the particle buffer, which carries a
+// companion distance attachment; that attachment must be written to something
+// defined, and zero is what "no particle here" means to everything that reads
+// it.  When the target has only one attachment the second write is discarded.
+layout(location = 0) out vec4 f_color;
+layout(location = 1) out vec4 f_aux;
 uniform sampler2D u_src;
 uniform vec2 u_dir;          // texel-sized step along x or y
 void main() {
@@ -1658,6 +2295,7 @@ void main() {
         c += texture(u_src, v_uv - u_dir * o[i]).rgb * w[i];
     }
     f_color = vec4(c, 1.0);
+    f_aux = vec4(0.0);
 }
 """
 
@@ -1817,8 +2455,19 @@ class Renderer:
         self.steps = ARGS.steps
         self.spin = -1.0          # matches the sense the N-body disk orbits in
         self.jet_bright = 0.0     # volumetric polar jets, driven by the App
-        self.jet_len = 55.0
-        self.jet_rad = 2.6
+        self.jet_len = 70.0
+        self.jet_rad = 2.40       # collimated: the beam barely opens out
+        self.jet_twist = 0.70     # depth of the helical striping along it
+        # Radius of the shell inside which particles are lensed properly, by
+        # being picked up along the bent ray instead of assumed to be at
+        # infinity.  Fixed rather than tracking the disk, so that particles
+        # never swap layers mid-flight and pop.  See LENS_PICKUP_NOTE.
+        self.near_radius = 70.0   # in r_s
+        self.disk_h = 1.0         # scale-height multiplier for the drawn disk
+        self.gas_bright = 2.20    # emission per unit density of the debris gas
+        self.gas_opacity = 0.70   # how much of itself it hides behind
+        self.gas_soft = 5.0       # blur radius, in texels, for "screen" gas
+        self.gas_on = True
 
         quad = np.array([-1, -1, 3, -1, -1, 3], dtype="f4")
         self.quad_vbo = ctx.buffer(quad.tobytes())
@@ -1834,6 +2483,15 @@ class Renderer:
         self.prog_bright = self._fs(BRIGHT_FS)
         self.prog_blur = self._fs(BLUR_FS)
         self.prog_comp = self._fs(COMPOSITE_FS)
+
+        # The debris density field.  A byte per cell, sampled as a float: see
+        # the gas section up top for why it is quantised.
+        self.gas_tex = ctx.texture3d((GAS_NX, GAS_NY, GAS_NZ), 1, dtype="f1")
+        self.gas_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.gas_tex.repeat_x = False
+        self.gas_tex.repeat_y = False
+        self.gas_tex.repeat_z = False
+        self.clear_gas()
 
         self.pos_vbo = ctx.buffer(reserve=MAX_N * 12, dynamic=True)
         self.attr_vbo = ctx.buffer(reserve=MAX_N * 16, dynamic=True)
@@ -1858,15 +2516,24 @@ class Renderer:
         self.rh = max(240, int(self.win_h * self.scale))
         self.bw = max(64, self.rw // 4)
         self.bh_ = max(64, self.rh // 4)
-        for tex, fbo in self._targets:
-            fbo.release()
-            tex.release()
-        self.tex_scene, self.fbo_scene = self._target(self.rw, self.rh)
+        for obj in self._targets:
+            obj.release()
+        # Particles land in two layers, each with a companion distance buffer:
+        # "near" is everything inside the shell where light visibly bends and
+        # is picked up along the geodesic, "far" is everything outside it.
+        self.tex_scene, self.tex_sceneD, self.fbo_scene = self._layer(self.rw, self.rh)
+        self.tex_near, self.tex_nearD, self.fbo_near = self._layer(self.rw, self.rh)
         self.tex_hdr, self.fbo_hdr = self._target(self.rw, self.rh)
+        # scratch for the screen-space gas blur, which runs before pass 2 and
+        # so cannot borrow the HDR target
+        self.tex_blur, self.fbo_blur = self._target(self.rw, self.rh)
         self.tex_b0, self.fbo_b0 = self._target(self.bw, self.bh_)
         self.tex_b1, self.fbo_b1 = self._target(self.bw, self.bh_)
-        self._targets = [(self.tex_scene, self.fbo_scene), (self.tex_hdr, self.fbo_hdr),
-                         (self.tex_b0, self.fbo_b0), (self.tex_b1, self.fbo_b1)]
+        self._targets = [self.fbo_scene, self.fbo_near, self.fbo_hdr,
+                         self.fbo_blur, self.fbo_b0, self.fbo_b1,
+                         self.tex_scene, self.tex_sceneD, self.tex_near,
+                         self.tex_nearD, self.tex_hdr, self.tex_blur,
+                         self.tex_b0, self.tex_b1]
 
     def resize(self, w, h, scale=None):
         if scale is not None:
@@ -1877,18 +2544,37 @@ class Renderer:
     def _fs(self, source):
         return self.ctx.program(vertex_shader=FULLSCREEN_VS, fragment_shader=source)
 
-    def _target(self, w, h):
+    def _tex(self, w, h, filt=moderngl.LINEAR):
         tex = self.ctx.texture((w, h), 4, dtype="f2")
-        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        tex.filter = (filt, filt)
         tex.repeat_x = False
         tex.repeat_y = False
-        fbo = self.ctx.framebuffer(color_attachments=[tex])
-        return tex, fbo
+        return tex
+
+    def _target(self, w, h):
+        tex = self._tex(w, h)
+        return tex, self.ctx.framebuffer(color_attachments=[tex])
+
+    def _layer(self, w, h):
+        """A particle layer: additive colour plus a (weight * distance,
+        weight) buffer.  The distance buffer is point-sampled -- interpolating
+        between two texels holding unrelated distances invents a depth that
+        nothing in the scene is at, and the lensing pass would then deposit
+        light at it."""
+        col = self._tex(w, h)
+        dist = self._tex(w, h, moderngl.NEAREST)
+        return col, dist, self.ctx.framebuffer(color_attachments=[col, dist])
 
     def _blit(self, prog):
         vao = self.ctx.vertex_array(prog, [(self.quad_vbo, "2f", "in_pos")])
         vao.render(moderngl.TRIANGLES, vertices=3)
         vao.release()
+
+    def upload_gas(self, arr):
+        self.gas_tex.write(arr.tobytes())
+
+    def clear_gas(self):
+        self.gas_tex.write(bytes(GAS_NX * GAS_NY * GAS_NZ))
 
     def upload_scene(self, scene):
         self.attr_vbo.write(scene.attrib.tobytes())
@@ -1928,7 +2614,7 @@ class Renderer:
             [(self.orbit_pos_vbo, "3f", "in_pos"), (self.orbit_col_vbo, "3f", "in_col")])
 
     def draw(self, scene, cam, positions, sim_time, lensing,
-             vertex_count=None, line_kinds=frozenset()):
+             vertex_count=None, line_kinds=frozenset(), extras=()):
         ctx = self.ctx
         aspect = self.rw / float(self.rh)
         view, right, up, fwd = look_at(cam.eye, cam.target)
@@ -1939,24 +2625,41 @@ class Renderer:
         eye = cam.eye.astype(np.float32)
         tan_half = math.tan(math.radians(cam.fov) * 0.5)
 
-        # --- pass 1: particles into the HDR scene buffer ---------------------
+        # --- pass 1: particles into the HDR scene buffers ---------------------
+        # Split into a far and a near layer whenever the lensing pass will run,
+        # because the two are placed on screen by completely different means:
+        # the near layer is picked up along the bent ray, the far layer is
+        # composited either straight through (in front of the hole) or by the
+        # escaping direction (behind it).  See LENS_PICKUP_NOTE in the shader.
+        split = bool(lensing and scene.bh)
+        near_r = self.near_radius * scene.world_rs
+        bh_pos = (float(positions[0, 0]), float(positions[0, 1]),
+                  float(positions[0, 2])) if len(positions) else (0.0, 0.0, 0.0)
+        n_draw = vertex_count or scene.n
+
         self.pos_vbo.write(positions.tobytes())
         self.fbo_scene.use()
         ctx.viewport = (0, 0, self.rw, self.rh)
-        ctx.clear(0.0, 0.0, 0.0, 1.0)
+        ctx.clear(0.0, 0.0, 0.0, 0.0)
         ctx.enable(moderngl.BLEND)
         ctx.blend_func = (moderngl.ONE, moderngl.ONE)
         ctx.enable(moderngl.PROGRAM_POINT_SIZE)
         p = self.prog_particle
         setu(p, "u_viewProj", vp)
         setu(p, "u_camPos", tuple(float(x) for x in eye))
+        setu(p, "u_bhPos", bh_pos)
         setu(p, "u_pxScale", 0.5 * self.rh / tan_half)
         setu(p, "u_gain", scene.gain * self.particle_gain)
-        self.particle_vao.render(moderngl.POINTS, vertices=vertex_count or scene.n)
+        setu(p, "u_nearR", near_r)
+        setu(p, "u_layer", 2 if split else 0)
+        self.particle_vao.render(moderngl.POINTS, vertices=n_draw)
+        for first, count in extras:
+            self.particle_vao.render(moderngl.POINTS, vertices=count, first=first)
 
         # --- orbit / mission-path lines, same buffer, same blend mode --------
         if line_kinds and self.orbit_vao is not None:
             setu(self.prog_orbit, "u_viewProj", vp)
+            setu(self.prog_orbit, "u_camPos", tuple(float(x) for x in eye))
             for first, count, kind, name in self.line_ranges:
                 if (kind == "orbit" and "orbit" in line_kinds) or \
                    (kind == "mission" and name in line_kinds):
@@ -1964,13 +2667,70 @@ class Renderer:
 
         ctx.disable(moderngl.BLEND)
 
+        # --- pass 1a': screen-space gas ------------------------------------
+        # Two separable blurs over the particle buffer.  A galaxy's light adds
+        # up along the ray with nothing absorbing it, so spreading each star
+        # over a few pixels and letting them overlap is not a stand-in for a
+        # gas -- it is what an optically thin one does.  The blur conserves
+        # total light, so this changes how the material looks without changing
+        # how much of it there is.
+        if scene.gas == "screen" and self.gas_on and self.gas_soft > 0.01:
+            # Split into whatever number of passes keeps each one's taps close
+            # enough together to cover the ground between them.  The kernel is
+            # five samples wide at one-texel spacing; stretched much past that
+            # it stops being a blur and starts being a regular pattern of
+            # samples, which shows up as a grid laid over the whole galaxy.
+            passes = max(1, int(math.ceil(self.gas_soft / 1.25)))
+            k = self.gas_soft / passes
+            for _ in range(passes):
+                self.fbo_blur.use()
+                ctx.viewport = (0, 0, self.rw, self.rh)
+                self.tex_scene.use(0)
+                setu(self.prog_blur, "u_src", 0)
+                setu(self.prog_blur, "u_dir", (k / self.rw, 0.0))
+                self._blit(self.prog_blur)
+
+                self.fbo_scene.use()
+                ctx.viewport = (0, 0, self.rw, self.rh)
+                self.tex_blur.use(0)
+                setu(self.prog_blur, "u_dir", (0.0, k / self.rh))
+                self._blit(self.prog_blur)
+
+        # --- pass 1b: the near layer, on its own so the lensing pass can
+        # place it along the geodesic instead of at infinity -----------------
+        self.fbo_near.use()
+        ctx.viewport = (0, 0, self.rw, self.rh)
+        ctx.clear(0.0, 0.0, 0.0, 0.0)
+        if split:
+            ctx.enable(moderngl.BLEND)
+            ctx.blend_func = (moderngl.ONE, moderngl.ONE)
+            setu(p, "u_layer", 1)
+            self.particle_vao.render(moderngl.POINTS, vertices=n_draw)
+            for first, count in extras:
+                self.particle_vao.render(moderngl.POINTS, vertices=count, first=first)
+            ctx.disable(moderngl.BLEND)
+
         # --- pass 2: lensing (or straight-through) ---------------------------
         self.fbo_hdr.use()
         ctx.viewport = (0, 0, self.rw, self.rh)
         self.tex_scene.use(0)
-        if lensing and scene.bh:
+        self.tex_sceneD.use(1)
+        self.tex_near.use(2)
+        self.tex_nearD.use(3)
+        self.gas_tex.use(4)
+        gas_bright = (self.gas_bright
+                      if (scene.gas == "volume" and self.gas_on) else 0.0)
+        # the grid is centred on the origin, so in the marcher's hole-centred
+        # frame it sits at minus the hole's own offset from there
+        gas_off = tuple(-float(x) / max(scene.world_rs, 1e-6) for x in bh_pos)
+        gas_mode = 0 if scene.bh else 1
+        if split:
             g = self.prog_lens
             setu(g, "u_scene", 0)
+            setu(g, "u_sceneD", 1)
+            setu(g, "u_near", 2)
+            setu(g, "u_nearD", 3)
+            setu(g, "u_nearR", self.near_radius)
             setu(g, "u_viewProj", vp)
             setu(g, "u_camPos", tuple(float(x) for x in eye))
             setu(g, "u_camRight", tuple(float(x) for x in right))
@@ -1978,8 +2738,7 @@ class Renderer:
             setu(g, "u_camFwd", tuple(float(x) for x in fwd))
             setu(g, "u_tanHalf", tan_half)
             setu(g, "u_aspect", aspect)
-            setu(g, "u_bhPos", (float(positions[0, 0]), float(positions[0, 1]),
-                                float(positions[0, 2])))
+            setu(g, "u_bhPos", bh_pos)
             setu(g, "u_rs", scene.world_rs)
             setu(g, "u_time", sim_time)
             setu(g, "u_diskIn", scene.disk_in)
@@ -1990,15 +2749,35 @@ class Renderer:
             setu(g, "u_jetBright", self.jet_bright)
             setu(g, "u_jetLen", self.jet_len)
             setu(g, "u_jetRad", self.jet_rad)
+            setu(g, "u_jetTwist", self.jet_twist)
+            setu(g, "u_diskH", self.disk_h)
+            setu(g, "u_gas", 4)
+            setu(g, "u_gasHalf", scene.gas_half)
+            setu(g, "u_gasOff", gas_off)
+            setu(g, "u_gasMode", gas_mode)
+            setu(g, "u_gasBright", gas_bright)
+            setu(g, "u_gasOpacity", self.gas_opacity)
+            setu(g, "u_gasStep", max(1.0, 2.8 * scene.gas_half[0] / GAS_NX))
             self._blit(g)
         else:
             g = self.prog_flat
             setu(g, "u_scene", 0)
+            setu(g, "u_near", 2)
             setu(g, "u_camRight", tuple(float(x) for x in right))
             setu(g, "u_camUp", tuple(float(x) for x in up))
             setu(g, "u_camFwd", tuple(float(x) for x in fwd))
+            setu(g, "u_camPos", tuple(float(x) for x in eye))
+            setu(g, "u_bhPos", bh_pos)
+            setu(g, "u_rs", scene.world_rs)
+            setu(g, "u_diskIn", scene.disk_in)
             setu(g, "u_tanHalf", tan_half)
             setu(g, "u_aspect", aspect)
+            setu(g, "u_gas", 4)
+            setu(g, "u_gasHalf", scene.gas_half)
+            setu(g, "u_gasOff", gas_off)
+            setu(g, "u_gasMode", gas_mode)
+            setu(g, "u_gasBright", gas_bright)
+            setu(g, "u_gasOpacity", self.gas_opacity)
             self._blit(g)
 
         # --- pass 3: bloom ---------------------------------------------------
@@ -2059,18 +2838,18 @@ class Sim:
                                     # is throughput, not loss -- what reaches the
                                     # hole is resupplied, so the disk is a steady
                                     # state rather than a dwindling one.
-        self.visc_radius = 26.0     # only inside here, where the stream piles up
+        self.visc_radius = 42.0     # only inside here, where the stream piles up
         self.sustain_disk = True    # resupply accreted material, so the disk persists
-        self.feed_radius = 20.0     # where a sustained disk is resupplied
-        self.return_radius = 150.0  # past here, scattered material is brought back
+        self.feed_radius = 26.0     # where a sustained disk is resupplied
+        self.return_radius = 210.0  # past here, scattered material is brought back
         self.star_intact = False    # self-gravity only matters while a star is whole
         self.jet = True             # twin polar jets off the inner disk
         self.jet_rate = 0.0018      # per-frame chance a disk particle is launched
-        self.jet_range = 55.0       # jet material is returned to the disk past here
-        self.jet_source = 16.0      # jets are fed from inside this radius
-        self.jet_base = 2.6         # launch height above the hole
-        self.jet_speed = 0.85       # launch speed (c = 1), above local escape
-        self.jet_spread = 0.09      # opening angle as a fraction of jet speed
+        self.jet_range = 70.0       # jet material is returned to the disk past here
+        self.jet_source = 18.0      # jets are fed from inside this radius
+        self.jet_base = 2.2         # launch height above the hole
+        self.jet_speed = 0.88       # launch speed (c = 1), above local escape
+        self.jet_spread = 0.032     # opening angle as a fraction of jet speed
         self.circularising = False  # switched on once the star reaches pericentre
 
     def load(self, key):
@@ -2088,11 +2867,29 @@ class Sim:
             k_upload_satellites(s.n_sat, s.sat_parent, s.sat_u, s.sat_v,
                                 s.sat_radius, s.sat_rate, s.sat_phase0)
             k_update_satellites(s.n_dynamic, s.n_sat, 0.0)
-        k_accel(s.n_dynamic, s.n_src, s.gconst, s.pw_rs)
+        lo, hi = self.src_bounds()
+        k_accel(s.n_dynamic, lo, hi, s.gconst, s.pw_rs)
         self.time = 0.0
         self.circularising = False
         self.star_intact = False
         return s
+
+    def src_bounds(self):
+        """Which particles act as gravity sources this step, as a half-open
+        range.  The hole at index 0 is handled separately by k_accel through
+        the Paczynski-Wiita term, so it is deliberately left out of the range
+        whenever a pseudo-Newtonian hole is present."""
+        s = self.scene
+        if s.star_n:
+            # Only the star that is still whole self-gravitates.  Once it is a
+            # stretched stream the hole dominates utterly, so dropping the
+            # older slots costs nothing physically and keeps the inner loop at
+            # one star's worth of sources no matter how many have been dropped.
+            if self.self_gravity and self.star_intact and s.star_lo >= 1:
+                return s.star_lo, s.star_lo + (s.star_src or s.star_n)
+            return 1, 1
+        lo = 1 if s.pw_rs > 0.0 else 0
+        return lo, s.n_src
 
     def spawn_star(self, azimuth=0.5 * math.pi):
         """Drop a fresh star onto the hole.  Slots are reused oldest-first once
@@ -2102,7 +2899,8 @@ class Sim:
             return False
         slot = s.star_spawned % s.star_slots
         lo = 1 + slot * s.star_n
-        p, v, m, soft = make_star(s.star_cfg, s.star_n, self.rng, azimuth)
+        p, v, m, soft = make_star(s.star_cfg, s.star_n, self.rng, azimuth,
+                                  n_src=s.star_src)
         k_write_block(lo, s.star_n, p, v, m, soft)
         s.star_spawned += 1
         # grow the live range to cover every slot used so far; every dynamic
@@ -2112,25 +2910,39 @@ class Sim:
         s.n_dynamic = max(s.n_dynamic, live)
         s.n_base = s.n_dynamic + s.n_sat
         self.star_intact = True
-        s.n_src = s.n_dynamic if self.self_gravity else 1
+        s.star_lo = lo
+        # Stretch the density grid out to wherever this star is coming from.
+        # Left at its default the star would spend its whole infall outside
+        # the grid and simply not be drawn, and the grid's own edge would show
+        # up as a straight line across the sky the moment debris reached it.
+        reach = max(s.star_cfg.get("r_start", s.star_cfg["r_apo"]),
+                    0.75 * s.star_cfg["r_apo"])
+        half = min(max(1.15 * reach, 110.0), 280.0)
+        s.gas_half = (half, min(max(0.22 * half, 30.0), 75.0))
+        # and material is only "scattered away" past where the star came from,
+        # or a star dropped from far out is teleported into the disk the
+        # instant it appears
+        self.return_radius = max(self.return_radius, 1.4 * reach)
         k_balance_momentum(s.n_dynamic)
-        k_accel(s.n_dynamic, s.n_src, s.gconst, s.pw_rs)
+        src_lo, src_hi = self.src_bounds()
+        s.n_src = src_hi - src_lo + 1
+        k_accel(s.n_dynamic, src_lo, src_hi, s.gconst, s.pw_rs)
         return True
 
     def step(self):
         s = self.scene
         dt = s.dt * self.speed
-        if s.star_n:
-            # Self-gravity is only what holds a star together on the way in;
-            # once it is a spread-out debris stream the hole dominates utterly,
-            # so dropping back to a single source afterwards costs nothing
-            # physically and takes the cost from O(N^2) to O(N).
-            s.n_src = s.n_dynamic if (self.self_gravity and self.star_intact) else 1
+        # Self-gravity is only what holds a star together on the way in; once
+        # it is a spread-out stream the hole dominates utterly, so the source
+        # range collapses to the hole afterwards and the cost drops from
+        # O(N^2) to O(N).  See Sim.src_bounds.
+        src_lo, src_hi = self.src_bounds()
+        s.n_src = src_hi - src_lo + (1 if s.pw_rs > 0.0 else 0)
         eating = bool(s.star_n) and s.n_dynamic > 1
         for _ in range(s.substeps):
             k_kick(s.n_dynamic, 0.5 * dt)
             k_drift(s.n_dynamic, dt)
-            k_accel(s.n_dynamic, s.n_src, s.gconst, s.pw_rs)
+            k_accel(s.n_dynamic, src_lo, src_hi, s.gconst, s.pw_rs)
             k_kick(s.n_dynamic, 0.5 * dt)
             self.time += dt
             if eating:
@@ -2149,6 +2961,7 @@ class Sim:
             # is; with momentum conserved this is exactly what the hole's
             # velocity would have been anyway.
             k_balance_momentum(s.n_dynamic)
+            k_recentre(s.n_dynamic)
             if self.viscosity > 0.0 and self.circularising:
                 frac = 1.0 - math.exp(-self.viscosity * dt * s.substeps)
                 k_circularise(1, s.n_dynamic, frac, self.inflow,
@@ -2212,11 +3025,18 @@ class App:
         self.show_gui = True
         self.show_labels = False
         self.show_orbits = False
-        self.show_heliosphere = False
+        self.extras_on = {}    # name -> bool, populated fresh per scene
         self.mission_on = {}   # mission name -> bool, populated fresh per scene
         self.auto_disk = True  # let the ray-marched disk grow in from the debris
-        self.disk_peak = 2.1   # brightness the emergent disk builds up to
-        self.jet_peak = 0.38   # brightness the polar jets build up to
+        self.disk_peak = 3.0   # brightness the emergent disk builds up to
+        self.jet_peak = 0.22   # brightness the polar jets build up to
+        self.star_sprite = 0.300  # point radius inside a star that is still whole
+        self.star_glow = 0.0      # 1 while it is a star, 0 once it is a stream
+        self.star_bound = 0.0     # fraction of it still inside 2 r_star
+        self.star_core = np.zeros(3, dtype=np.float32)
+        self.tde_tick = 0         # phase of the every-fourth-frame debris survey
+        self.tgt_disk = (0.0, 3.0, 26.0)   # held between those surveys
+        self.gas_amp = 1.0        # how much material one particle stands for
         self.debris_inner = 0.0
         self.debris_outer = 0.0
         self.debris_frac = 0.0
@@ -2226,13 +3046,24 @@ class App:
         self.renderer.upload_scene(self.scene)
         self.cam.adopt(self.scene)
         self.mission_on = {pl["name"]: False for pl in self.scene.polylines if pl["kind"] == "mission"}
+        self.extras_on = {name: False for name, _, _ in self.scene.extras}
         self.debris_inner = self.debris_outer = self.debris_frac = 0.0
+        self.star_glow = self.star_bound = 0.0
+        self.tgt_disk = (0.0, self.scene.disk_in, self.scene.disk_out)
+        self.renderer.clear_gas()
         if self.scene.star_n:
             # a bare hole: nothing to light up until a star has been torn apart
             self.renderer.disk_bright = 0.0
             self.renderer.jet_bright = 0.0
             self.scene.disk_in, self.scene.disk_out = 3.0, 26.0
         return self.scene
+
+    def update_gas(self):
+        """Re-splat the debris into the density grid the renderer marches."""
+        s, r = self.scene, self.renderer
+        if not (s.gas == "volume" and r.gas_on) or s.n_dynamic <= s.gas_lo:
+            return
+        r.upload_gas(build_gas(s, self.gas_amp))
 
     def update_tde(self, positions):
         """Per-frame tidal-disruption bookkeeping: watch the debris, start
@@ -2243,53 +3074,91 @@ class App:
         if not s.star_n or s.star_spawned == 0 or s.n_dynamic <= 1:
             return
         deb = positions[1:s.n_dynamic]
-        rad = np.linalg.norm(deb, axis=1)
-        alive = rad < 1.0e3
+
+        # Everything below that only feeds a smoothed scalar -- how much of the
+        # debris is on a disk-like orbit, where its edges are -- is measured on
+        # a stride through the particles rather than all of them.  Tens of
+        # thousands of points is a count chosen so a stream draws smoothly; a
+        # few thousand is already far more than these statistics need, and at
+        # 60 Hz the difference is milliseconds a frame.
+        step = max(1, (s.n_dynamic - 1) // 8000)
+        sub = deb[::step]
+        r_sub = np.linalg.norm(sub, axis=1)
+        alive = r_sub < 1.0e3
         n_alive = int(alive.sum())
         if n_alive == 0:
             self.debris_frac = 0.0
             return
 
-        r_alive = rad[alive]
+        r_alive = r_sub[alive]
         if not sim.circularising and r_alive.min() < 1.35 * s.star_cfg["r_peri"]:
-            # pericentre reached: the stream is forming, and the star is no
-            # longer a star that needs its own gravity to stay whole
+            # pericentre reached, so whatever came off the star is now a stream
+            # that wants the viscous damping turned on
             sim.circularising = True
-            sim.star_intact = False
 
         # "Disk-like" means on a near-circular orbit, not merely nearby: an
         # intact star coasting through apocentre has little radial motion too,
         # and must not be mistaken for a disk.  Comparing its angular momentum
         # against the circular value at the same radius separates the two.
-        vel_all = vel.to_numpy()[1:s.n_dynamic][alive]
-        p_alive = deb[alive]
-        rhat = p_alive / r_alive[:, None]
-        v_r = np.abs(np.sum(vel_all * rhat, axis=1))
-        v_c = np.sqrt(0.5 * r_alive) / np.maximum(r_alive - s.pw_rs, 1e-3)
-        l_mag = np.linalg.norm(np.cross(p_alive, vel_all), axis=1)
-        kappa = l_mag / np.maximum(r_alive * v_c, 1e-9)
-        disky = (r_alive < 45.0) & (v_r < 0.30 * v_c) & (kappa > 0.75) & (kappa < 1.3)
-        cnt = int(disky.sum())
-        self.debris_frac = cnt / float(n_alive)
+        #
+        # Measured a few times a second rather than every frame: it needs the
+        # velocities, and pulling those back off the GPU is the most expensive
+        # thing in this function.  Nothing it feeds moves quickly -- they are
+        # all eased towards over seconds -- so the targets are simply held
+        # between measurements, and the easing below still runs every frame.
+        self.tde_tick = (self.tde_tick + 1) % 4
+        if self.tde_tick == 0:
+            # Is the star still a star?  This used to be assumed rather than
+            # measured -- self-gravity was switched off the moment the star
+            # reached pericentre, on the grounds that by then it is a stream.
+            # For the default star it is.  For a dense one on a wide pericentre
+            # it is not, and switching its gravity off was what tore it apart:
+            # the panel would say it survives the pass and it would come apart
+            # anyway.  So ask the particles instead.
+            lo = s.star_lo
+            if lo >= 1 and lo + s.star_n <= s.n_dynamic:
+                blk = positions[lo:lo + s.star_n:step]
+                self.star_core = np.median(blk, axis=0)
+                d_core = np.linalg.norm(blk - self.star_core, axis=1)
+                self.star_bound = float(
+                    (d_core < 1.5 * s.star_cfg["r_star"]).mean())
+            else:
+                self.star_bound = 0.0
+            sim.star_intact = self.star_bound > 0.50
 
-        tgt_bright, tgt_in, tgt_out = 0.0, s.disk_in, s.disk_out
-        if cnt > 60:
-            rr = r_alive[disky]
-            # 75th percentile, not 90th: a long-lived disk always has some
-            # scattered material way out past the body of it, and letting that
-            # set the outer edge inflates the drawn disk until it swallows the
-            # frame and flattens the temperature gradient across it
-            self.debris_inner = float(np.percentile(rr, 8))
-            self.debris_outer = float(np.percentile(rr, 70))
-            # Pinned near the ISCO rather than following the debris.  Inside
-            # the ISCO material plunges in a few orbits, so the particles there
-            # are always sparse -- but a real disk still radiates right down to
-            # it, and letting the drawn inner edge drift out to where the
-            # particles thin out leaves an obvious empty ring around the hole.
-            tgt_in = 3.2
-            tgt_out = min(max(self.debris_outer, tgt_in + 3.0), 28.0)
-            tgt_bright = self.disk_peak * min(1.0, self.debris_frac / 0.35)
+            vel_all = vel.to_numpy()[1:s.n_dynamic:step][alive]
+            p_alive = sub[alive]
+            rhat = p_alive / r_alive[:, None]
+            v_r = np.abs(np.sum(vel_all * rhat, axis=1))
+            v_c = np.sqrt(0.5 * r_alive) / np.maximum(r_alive - s.pw_rs, 1e-3)
+            l_mag = np.linalg.norm(np.cross(p_alive, vel_all), axis=1)
+            kappa = l_mag / np.maximum(r_alive * v_c, 1e-9)
+            disky = ((r_alive < 60.0) & (v_r < 0.30 * v_c)
+                     & (kappa > 0.75) & (kappa < 1.3))
+            cnt = int(disky.sum())
+            self.debris_frac = cnt / float(n_alive)
 
+            self.tgt_disk = (0.0, s.disk_in, s.disk_out)
+            if cnt > 60:
+                rr = r_alive[disky]
+                # 70th percentile, not 90th: a long-lived disk always has some
+                # scattered material way out past the body of it, and letting
+                # that set the outer edge inflates the drawn disk until it
+                # swallows the frame and flattens the temperature gradient
+                self.debris_inner = float(np.percentile(rr, 8))
+                self.debris_outer = float(np.percentile(rr, 70))
+                # Pinned near the ISCO rather than following the debris.
+                # Inside the ISCO material plunges in a few orbits, so the
+                # particles there are always sparse -- but a real disk still
+                # radiates right down to it, and letting the drawn inner edge
+                # drift out to where the particles thin out leaves an obvious
+                # empty ring around the hole.
+                tgt_in = 3.2
+                self.tgt_disk = (self.disk_peak * min(1.0, self.debris_frac / 0.35),
+                                 tgt_in,
+                                 min(max(self.debris_outer, tgt_in + 3.0), 36.0))
+
+        tgt_bright, tgt_in, tgt_out = self.tgt_disk
         if self.auto_disk:
             # ease toward the target so the disk grows in smoothly instead of
             # snapping around as debris sloshes through pericentre
@@ -2302,20 +3171,54 @@ class App:
         tgt_jet *= min(1.0, self.debris_frac / 0.35)
         r.jet_bright += (tgt_jet - r.jet_bright) * 0.02
 
-        # re-tint by depth in the potential: a star still on its way in stays
-        # stellar warm-white, debris shock-heats and brightens as it spirals in
-        t = np.clip((rad - 3.0) / 27.0, 0.0, 1.0)[:, None]
-        hot = np.array([1.00, 0.93, 0.88])[None, :]
-        cool = np.array([1.00, 0.80, 0.58])[None, :]
-        boost = (0.85 + 1.10 * (1.0 - t) ** 2)
-        col = (hot * (1.0 - t) + cool * t) * boost
+        self.star_glow += (self.star_bound - self.star_glow) * 0.02
+        if s.gas == "volume" and r.gas_on:
+            return      # nothing is drawn as a sprite, so nothing to tint
+
+        rad = np.linalg.norm(deb, axis=1)
+        # Re-tint by depth in the potential: a star still on its way in stays
+        # stellar warm-white, debris shock-heats and brightens as it spirals in.
+        # Written channel by channel rather than by broadcasting a pair of
+        # colours: this one runs over every particle every frame, and the
+        # broadcast form allocates half a dozen arrays that size to do it.
+        t = np.clip((rad - 3.0) * (1.0 / 34.0), 0.0, 1.0)
+        boost = 0.85 + 1.10 * (1.0 - t) ** 2
+        col = np.empty((rad.size, 3), dtype=np.float32)
+        col[:, 0] = boost                             # 1.00 hot and cool alike
+        col[:, 1] = (0.88 - 0.18 * t) * boost
+        col[:, 2] = (0.74 - 0.32 * t) * boost
         # anything well off the disk plane is in a jet: give the beams their own
         # hot blue-white so they separate from the disk instead of reading as
         # stray debris
         jetting = np.abs(deb[:, 1]) > 0.45 * np.maximum(rad, 1e-6)
-        col[jetting] = np.array([0.72, 0.86, 1.25])
+        col[jetting] = np.array([0.72, 0.86, 1.25], dtype=np.float32)
+        # Deliberately fat and faint rather than small and bright.  Fourteen
+        # thousand points cannot cover a stream a hundred r_s long, so drawn
+        # sharp they read as a scatter of separate specks; drawn as broad soft
+        # blobs at a fraction of the brightness they overlap into something
+        # continuous, which is what the stream actually is.
+        size = np.where(jetting, np.float32(0.110), np.float32(0.130))
+
+        # A star is a filled body, a stream is a thread, and one point radius
+        # cannot draw both: at the size that makes a hundred-r_s stream look
+        # like a fine filament, a whole star is a faint spray of dots.  So the
+        # sprite radius follows each particle's distance from the still-bound
+        # core -- fat and overlapping inside it, fine out in the tails -- and
+        # the core is brightened as well, because a star should read as the
+        # brightest thing in frame until the hole takes it apart.  Applied only
+        # to the star most recently dropped; anything older is long since a
+        # stream, and its sprites stay thin.
+        lo = s.star_lo
+        if self.star_glow > 0.01 and lo >= 1 and lo + s.star_n <= s.n_dynamic:
+            blk = positions[lo:lo + s.star_n]
+            d = np.linalg.norm(blk - self.star_core, axis=1)
+            w = self.star_glow * np.exp(-(d / (1.6 * s.star_cfg["r_star"])) ** 2)
+            j = slice(lo - 1, lo - 1 + s.star_n)
+            size[j] = size[j] + (self.star_sprite - size[j]) * w
+            col[j] *= (1.0 + 1.2 * w)[:, None]
+
         s.attrib[1:s.n_dynamic, 0:3] = col
-        s.attrib[1:s.n_dynamic, 3] = np.where(jetting, 0.055, 0.030)
+        s.attrib[1:s.n_dynamic, 3] = size
         r.update_attrib(s, 1, s.n_dynamic)
 
     def spawn_star(self):
@@ -2325,6 +3228,11 @@ class App:
         from back there it is centred in frame and falls in past the hole."""
         return self.sim.spawn_star(self.cam.yaw + math.pi + 0.44)
 
+    def extra_ranges(self):
+        """(first, count) for each switched-on block of static extras."""
+        return [(lo, n) for name, lo, n in self.scene.extras
+                if self.extras_on.get(name)]
+
     def visible_lines(self):
         """The set draw() checks each polyline against: the literal string
         "orbit" gates every orbit-kind line at once, one flag each mission."""
@@ -2332,6 +3240,29 @@ class App:
         if self.show_orbits:
             lines.add("orbit")
         return lines
+
+
+# Every key the main loop binds, in one place, so the panel that lists them
+# cannot drift away from the loop that handles them.
+KEY_HELP = [
+    ("1 2 3 4", "load a scene"),
+    ("R", "restart the current scene"),
+    ("space", "pause / resume"),
+    ("[ ]", "slower / faster  (also - and +)"),
+    ("X", "drop a star on the black hole"),
+    ("V", "draw the material as gas, or as points"),
+    ("L", "gravitational lensing on / off"),
+    ("N", "body name labels"),
+    ("O", "orbit paths"),
+    ("F", "reset the camera"),
+    ("G", "hide / show these panels"),
+    ("F11", "fullscreen"),
+    ("esc", "quit"),
+    ("W S", "move in / out"),
+    ("A D", "swing left / right"),
+    ("Q E", "swing up / down"),
+    ("arrows", "pan"),
+]
 
 
 SCENE_NAMES = {
@@ -2400,7 +3331,7 @@ def draw_gui(app):
     imgui.set_next_window_size(imgui.ImVec2(348, 336), imgui.Cond_.first_use_ever)
     imgui.begin("Simulation")
     imgui.push_item_width(-122)
-    sim, scene = app.sim, app.scene
+    sim, scene, r = app.sim, app.scene, app.renderer
 
     if imgui.button("Pause" if not sim.paused else "Resume", imgui.ImVec2(96, 0)):
         sim.paused = not sim.paused
@@ -2471,158 +3402,191 @@ def draw_gui(app):
         cam.target[:] = 0.0
     imgui.text("drag LMB orbit | MMB or shift+LMB pan")
     imgui.text("wheel zoom | arrows pan | WASDQE fly")
+    if imgui.collapsing_header("keyboard"):
+        for key, what in KEY_HELP:
+            imgui.text(f"{key:<10s} {what}")
     imgui.pop_item_width()
     imgui.end()
 
     # --- black hole --------------------------------------------------------
     w = app.renderer.win_w
-    imgui.set_next_window_pos(imgui.ImVec2(w - 386, 12), imgui.Cond_.first_use_ever)
-    imgui.set_next_window_size(imgui.ImVec2(374, 276), imgui.Cond_.first_use_ever)
-    imgui.begin("Black Hole (ray marched)")
-    imgui.push_item_width(-132)
-    r = app.renderer
-    changed, val = imgui.checkbox("gravitational lensing", app.lensing)
-    if changed:
-        app.lensing = val
-    if not scene.bh:
-        imgui.text_colored(imgui.ImVec4(1.0, 0.75, 0.3, 1.0),
-                           "inactive: scene 3 has the black hole")
-    imgui.begin_disabled(not scene.bh)
-    changed, val = imgui.slider_int("march steps", r.steps, 40, 420)
-    if changed:
-        r.steps = val
-    changed, val = imgui.slider_float("disk brightness", r.disk_bright, 0.0, 6.0, "%.2f")
-    if changed:
-        r.disk_bright = val
-    changed, val = imgui.slider_float("disk inner", scene.disk_in, 1.2, 12.0, "%.2f r_s")
-    if changed:
-        scene.disk_in = min(val, scene.disk_out - 1.0)
-    changed, val = imgui.slider_float("disk outer", scene.disk_out, 6.0, 70.0, "%.1f r_s")
-    if changed:
-        scene.disk_out = max(val, scene.disk_in + 1.0)
-    changed, val = imgui.checkbox("flip disk spin", r.spin > 0.0)
-    if changed:
-        r.spin = 1.0 if val else -1.0
-    imgui.end_disabled()
-    imgui.separator_text("geometry")
-    imgui.text(f"mass         {BH_SOLAR_MASSES:.0f} M_sun")
-    imgui.text(f"horizon      1.00 r_s  ({BH_RS_KM:6.1f} km)")
-    imgui.text(f"photon ring  1.50 r_s  ({1.5 * BH_RS_KM:6.1f} km)")
-    imgui.text(f"ISCO         3.00 r_s  ({3.0 * BH_RS_KM:6.1f} km)")
-    imgui.text(f"camera       {cam.dist / max(scene.world_rs, 1e-6):8.2f} r_s")
-    imgui.pop_item_width()
-    imgui.end()
-
-    # --- tidal disruption ----------------------------------------------------
-    imgui.set_next_window_pos(imgui.ImVec2(360, 12), imgui.Cond_.first_use_ever)
-    imgui.set_next_window_size(imgui.ImVec2(336, 610), imgui.Cond_.first_use_ever)
-    imgui.begin("Tidal Disruption")
-    sim = app.sim
-    if not scene.star_n:
-        imgui.text_colored(imgui.ImVec4(1.0, 0.75, 0.3, 1.0),
-                           "inactive: scene 3 has the black hole")
-    imgui.begin_disabled(not scene.star_n)
-    imgui.push_item_width(-118)
-    if imgui.button("Spawn star  (X)", imgui.ImVec2(-1, 0)):
-        app.spawn_star()
-    cfg = scene.star_cfg or {"m_star": 0.0, "r_star": 0.0, "r_peri": 0.0, "r_apo": 0.0}
-    changed, val = imgui.slider_float("star mass", cfg["m_star"] * SIM_MASS_TO_SOLAR,
-                                      0.05, 4.0, "%.2f M_sun")
-    if changed:
-        cfg["m_star"] = val / SIM_MASS_TO_SOLAR
-    changed, val = imgui.slider_float("star radius", cfg["r_star"], 0.5, 10.0, "%.2f r_s")
-    if changed:
-        cfg["r_star"] = val
-    changed, val = imgui.slider_float("pericentre", cfg["r_peri"], 3.5, 30.0, "%.1f r_s")
-    if changed:
-        cfg["r_peri"] = min(val, cfg["r_apo"] - 5.0)
-    changed, val = imgui.slider_float("drop from", cfg["r_apo"], 15.0, 120.0, "%.0f r_s")
-    if changed:
-        cfg["r_apo"] = max(val, cfg["r_peri"] + 5.0)
-
-    if cfg["m_star"] > 0.0:
-        # r_t = r_h (M_bh / M_star)^(1/3), with r_h = 1.3 a and a = r_star / 2
-        r_t = 0.65 * cfg["r_star"] * (0.5 / cfg["m_star"]) ** (1.0 / 3.0)
-        beta = r_t / max(cfg["r_peri"], 1e-6)
-        verdict = "full disruption" if beta >= 1.0 else "survives the pass"
-        col = imgui.ImVec4(0.5, 1.0, 0.6, 1.0) if beta >= 1.0 else imgui.ImVec4(1.0, 0.8, 0.4, 1.0)
-        imgui.text(f"tidal radius {r_t:6.1f} r_s")
-        imgui.text_colored(col, f"beta = r_t/r_p = {beta:4.2f}  {verdict}")
-
-    imgui.separator_text("debris")
-    changed, val = imgui.checkbox("sustain disk (companion feed)", sim.sustain_disk)
-    if changed:
-        sim.sustain_disk = val
-    if sim.sustain_disk:
-        changed, val = imgui.slider_float("feed radius", sim.feed_radius, 8.0, 45.0, "%.1f r_s")
+    if scene.bh:
+        imgui.set_next_window_pos(imgui.ImVec2(w - 386, 12), imgui.Cond_.first_use_ever)
+        imgui.set_next_window_size(imgui.ImVec2(374, 276), imgui.Cond_.first_use_ever)
+        imgui.begin("Black Hole (ray marched)")
+        imgui.push_item_width(-132)
+        changed, val = imgui.checkbox("gravitational lensing", app.lensing)
         if changed:
-            sim.feed_radius = val
-    changed, val = imgui.checkbox("self-gravity", sim.self_gravity)
-    if changed:
-        sim.self_gravity = val
-    changed, val = imgui.checkbox("disk grows from debris", app.auto_disk)
-    if changed:
-        app.auto_disk = val
-    changed, val = imgui.slider_float("viscosity", sim.viscosity, 0.0, 0.03, "%.4f")
-    if changed:
-        sim.viscosity = val
-    changed, val = imgui.slider_float("accretion rate", sim.inflow, 0.0, 0.10, "%.3f")
-    if changed:
-        sim.inflow = val
-    imgui.separator_text("polar jets")
-    changed, val = imgui.checkbox("twin jets", sim.jet)
-    if changed:
-        sim.jet = val
-    imgui.begin_disabled(not sim.jet)
-    changed, val = imgui.slider_float("jet power", app.jet_peak, 0.0, 1.2, "%.2f")
-    if changed:
-        app.jet_peak = val
-    changed, val = imgui.slider_float("jet reach", app.renderer.jet_len, 15.0, 120.0, "%.0f r_s")
-    if changed:
-        app.renderer.jet_len = val
-        sim.jet_range = val
-    changed, val = imgui.slider_float("jet width", app.renderer.jet_rad, 0.6, 6.0, "%.2f r_s")
-    if changed:
-        app.renderer.jet_rad = val
-    imgui.end_disabled()
-    imgui.text(f"stars dropped  {scene.star_spawned:6d}")
-    imgui.text(f"{'recycled' if sim.sustain_disk else 'accreted':<14s} {scene.accreted:6d}")
-    imgui.text(f"bound fraction {app.debris_frac * 100.0:5.1f} %")
-    if app.debris_outer > 0.0:
-        imgui.text(f"debris  {app.debris_inner:5.1f} - {app.debris_outer:5.1f} r_s")
-    imgui.text("circularising" if sim.circularising else "waiting for pericentre")
-    imgui.pop_item_width()
-    imgui.end_disabled()
-    imgui.end()
+            app.lensing = val
+        changed, val = imgui.slider_int("march steps", r.steps, 40, 640)
+        if changed:
+            r.steps = val
+        changed, val = imgui.slider_float("lensed shell", r.near_radius, 12.0, 150.0, "%.0f r_s")
+        if changed:
+            r.near_radius = val
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Particles inside this radius are lensed by being picked "
+                              "up along the bent ray, so their images land in the same "
+                              "place as the disk they belong to. Outside it they are far "
+                              "enough away to composite straight through. Raising it "
+                              "costs march steps.")
+        changed, val = imgui.slider_float("disk brightness", r.disk_bright, 0.0, 6.0, "%.2f")
+        if changed:
+            r.disk_bright = val
+        changed, val = imgui.slider_float("disk inner", scene.disk_in, 1.2, 12.0, "%.2f r_s")
+        if changed:
+            scene.disk_in = min(val, scene.disk_out - 1.0)
+        changed, val = imgui.slider_float("disk outer", scene.disk_out, 6.0, 70.0, "%.1f r_s")
+        if changed:
+            scene.disk_out = max(val, scene.disk_in + 1.0)
+        changed, val = imgui.slider_float("disk thickness", r.disk_h, 0.25, 3.0, "%.2f")
+        if changed:
+            r.disk_h = val
+        changed, val = imgui.checkbox("flip disk spin", r.spin > 0.0)
+        if changed:
+            r.spin = 1.0 if val else -1.0
+        imgui.separator_text("geometry")
+        imgui.text(f"mass         {BH_SOLAR_MASSES:.0f} M_sun")
+        imgui.text(f"horizon      1.00 r_s  ({BH_RS_KM:6.1f} km)")
+        imgui.text(f"photon ring  1.50 r_s  ({1.5 * BH_RS_KM:6.1f} km)")
+        imgui.text(f"ISCO         3.00 r_s  ({3.0 * BH_RS_KM:6.1f} km)")
+        imgui.text(f"camera       {cam.dist / max(scene.world_rs, 1e-6):8.2f} r_s")
+        imgui.pop_item_width()
+        imgui.end()
+
+    if scene.star_n:
+        # --- tidal disruption ----------------------------------------------------
+        imgui.set_next_window_pos(imgui.ImVec2(360, 12), imgui.Cond_.first_use_ever)
+        imgui.set_next_window_size(imgui.ImVec2(336, 610), imgui.Cond_.first_use_ever)
+        imgui.begin("Tidal Disruption")
+        imgui.push_item_width(-118)
+        if imgui.button("Spawn star  (X)", imgui.ImVec2(-1, 0)):
+            app.spawn_star()
+        cfg = scene.star_cfg or {"m_star": 0.0, "r_star": 0.0, "r_peri": 0.0, "r_apo": 0.0}
+        changed, val = imgui.slider_float("star mass", cfg["m_star"] * SIM_MASS_TO_SOLAR,
+                                          0.05, 4.0, "%.2f M_sun")
+        if changed:
+            cfg["m_star"] = val / SIM_MASS_TO_SOLAR
+        changed, val = imgui.slider_float("star radius", cfg["r_star"], 0.5, 18.0, "%.2f r_s")
+        if changed:
+            cfg["r_star"] = val
+        changed, val = imgui.slider_float("pericentre", cfg["r_peri"], 3.5, 45.0, "%.1f r_s")
+        if changed:
+            cfg["r_peri"] = min(val, cfg["r_apo"] - 5.0)
+        changed, val = imgui.slider_float("apocentre", cfg["r_apo"], 20.0, 320.0, "%.0f r_s")
+        if changed:
+            cfg["r_apo"] = max(val, cfg["r_peri"] + 5.0)
+            # keep the drop point on the inbound leg of whatever orbit this is now
+            cfg["r_start"] = max(0.64 * cfg["r_apo"], cfg["r_peri"] * 1.6)
+        changed, val = imgui.slider_float("drop at", cfg.get("r_start", cfg["r_apo"]),
+                                          10.0, 320.0, "%.0f r_s")
+        if changed:
+            cfg["r_start"] = min(max(val, cfg["r_peri"] * 1.6), cfg["r_apo"])
+        changed, val = imgui.slider_float("star sprite", app.star_sprite, 0.03, 0.70, "%.3f r_s")
+        if changed:
+            app.star_sprite = val
+
+        if cfg["m_star"] > 0.0:
+            # r_t = r_h (M_bh / M_star)^(1/3), with r_h = 1.3 a and a = r_star / 2
+            r_t = 0.65 * cfg["r_star"] * (0.5 / cfg["m_star"]) ** (1.0 / 3.0)
+            beta = r_t / max(cfg["r_peri"], 1e-6)
+            verdict = "full disruption" if beta >= 1.0 else "survives the pass"
+            col = imgui.ImVec4(0.5, 1.0, 0.6, 1.0) if beta >= 1.0 else imgui.ImVec4(1.0, 0.8, 0.4, 1.0)
+            imgui.text(f"tidal radius {r_t:6.1f} r_s")
+            imgui.text_colored(col, f"beta = r_t/r_p = {beta:4.2f}  {verdict}")
+            # The star is drawn bigger than the hole, which is the right way round,
+            # but it is nothing like the true ratio -- so say so rather than let
+            # the picture imply otherwise.  See the preset's docstring.
+            r_km = cfg["r_star"] * BH_RS_KM
+            imgui.text(f"star radius {r_km:8.0f} km = {r_km / 696340.0:.4f} R_sun")
+            imgui.text_colored(imgui.ImVec4(0.65, 0.7, 0.8, 1.0),
+                               "(compact for its mass, so the disruption")
+            imgui.text_colored(imgui.ImVec4(0.65, 0.7, 0.8, 1.0),
+                               " happens where the lensing is visible)")
+
+        imgui.separator_text("debris")
+        changed, val = imgui.checkbox("sustain disk (companion feed)", sim.sustain_disk)
+        if changed:
+            sim.sustain_disk = val
+        if sim.sustain_disk:
+            changed, val = imgui.slider_float("feed radius", sim.feed_radius, 8.0, 45.0, "%.1f r_s")
+            if changed:
+                sim.feed_radius = val
+        changed, val = imgui.checkbox("self-gravity", sim.self_gravity)
+        if changed:
+            sim.self_gravity = val
+        changed, val = imgui.checkbox("disk grows from debris", app.auto_disk)
+        if changed:
+            app.auto_disk = val
+        changed, val = imgui.slider_float("viscosity", sim.viscosity, 0.0, 0.03, "%.4f")
+        if changed:
+            sim.viscosity = val
+        changed, val = imgui.slider_float("accretion rate", sim.inflow, 0.0, 0.10, "%.3f")
+        if changed:
+            sim.inflow = val
+        imgui.separator_text("polar jets")
+        changed, val = imgui.checkbox("twin jets", sim.jet)
+        if changed:
+            sim.jet = val
+        imgui.begin_disabled(not sim.jet)
+        changed, val = imgui.slider_float("jet power", app.jet_peak, 0.0, 1.2, "%.2f")
+        if changed:
+            app.jet_peak = val
+        changed, val = imgui.slider_float("jet reach", app.renderer.jet_len, 15.0, 160.0, "%.0f r_s")
+        if changed:
+            app.renderer.jet_len = val
+            sim.jet_range = val
+        changed, val = imgui.slider_float("jet width", app.renderer.jet_rad, 0.25, 4.0, "%.2f r_s")
+        if changed:
+            app.renderer.jet_rad = val
+        changed, val = imgui.slider_float("jet twist", app.renderer.jet_twist, 0.0, 1.0, "%.2f")
+        if changed:
+            app.renderer.jet_twist = val
+        changed, val = imgui.slider_float("beam spread", sim.jet_spread, 0.0, 0.20, "%.3f")
+        if changed:
+            sim.jet_spread = val
+        imgui.end_disabled()
+        imgui.text(f"stars dropped  {scene.star_spawned:6d}")
+        imgui.text(f"{'recycled' if sim.sustain_disk else 'accreted':<14s} {scene.accreted:6d}")
+        imgui.text(f"bound fraction {app.debris_frac * 100.0:5.1f} %")
+        if app.debris_outer > 0.0:
+            imgui.text(f"debris  {app.debris_inner:5.1f} - {app.debris_outer:5.1f} r_s")
+        imgui.text("circularising" if sim.circularising else "waiting for pericentre")
+        imgui.pop_item_width()
+        imgui.end()
 
     # --- solar system overlays ----------------------------------------------
-    imgui.set_next_window_pos(imgui.ImVec2(360, 634), imgui.Cond_.first_use_ever)
-    imgui.set_next_window_size(imgui.ImVec2(336, 250), imgui.Cond_.first_use_ever)
-    imgui.begin("Solar System")
-    is_ss = scene.name == "Solar System"
-    if not is_ss:
-        imgui.text_colored(imgui.ImVec4(1.0, 0.75, 0.3, 1.0),
-                           "inactive: scene 1 is the solar system")
-    imgui.begin_disabled(not is_ss)
-    changed, val = imgui.checkbox("body names  (N)", app.show_labels)
-    if changed:
-        app.show_labels = val
-    changed, val = imgui.checkbox("orbit paths  (O)", app.show_orbits)
-    if changed:
-        app.show_orbits = val
-    changed, val = imgui.checkbox("heliosphere / heliopause", app.show_heliosphere)
-    if changed:
-        app.show_heliosphere = val
-    if app.mission_on:
-        imgui.separator_text("space mission paths")
-        for name in app.mission_on:
-            changed, val = imgui.checkbox(name, app.mission_on[name])
+    if scene.extras or scene.labels:
+        imgui.set_next_window_pos(imgui.ImVec2(360, 12), imgui.Cond_.first_use_ever)
+        imgui.set_next_window_size(imgui.ImVec2(336, 300), imgui.Cond_.first_use_ever)
+        imgui.begin("Solar System")
+        changed, val = imgui.checkbox("body names  (N)", app.show_labels)
+        if changed:
+            app.show_labels = val
+        changed, val = imgui.checkbox("orbit paths  (O)", app.show_orbits)
+        if changed:
+            app.show_orbits = val
+        for name, _, count in scene.extras:
+            changed, val = imgui.checkbox(name, app.extras_on.get(name, False))
             if changed:
-                app.mission_on[name] = val
-                if val and name.startswith("Voyager"):
-                    app.show_heliosphere = True   # the paths only mean something next to it
-    imgui.end_disabled()
-    imgui.end()
+                app.extras_on[name] = val
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    f"{count} points, off by default. It sits far outside"
+                    " the planets, so seeing it means pulling the camera"
+                    " back until they are a knot in the middle.")
+        if app.mission_on:
+            imgui.separator_text("space mission paths")
+            for name in app.mission_on:
+                changed, val = imgui.checkbox(name, app.mission_on[name])
+                if changed:
+                    app.mission_on[name] = val
+                    if val and name.startswith("Voyager"):
+                        # the paths only mean something next to the boundary they cross
+                        for ex in app.extras_on:
+                            if ex.startswith("heliosphere"):
+                                app.extras_on[ex] = True
+        imgui.end()
 
     # --- render ------------------------------------------------------------
     imgui.set_next_window_pos(imgui.ImVec2(w - 386, 300), imgui.Cond_.first_use_ever)
@@ -2641,6 +3605,30 @@ def draw_gui(app):
     changed, val = imgui.slider_float("particle gain", r.particle_gain, 0.1, 4.0, "%.2f")
     if changed:
         r.particle_gain = val
+    # Only the scene whose gas has anything worth adjusting gets the panel.
+    # The black hole's is on by default and has nothing to tune that the
+    # exposure and bloom above do not already cover, so it lives on the V key
+    # alone rather than taking up room in every session.
+    # Only the scene whose gas has something worth adjusting gets a panel for
+    # it.  The black hole's is on by default and needs no dials the exposure
+    # and bloom above do not already cover, so it lives on the V key alone
+    # rather than taking up room in every session.
+    if scene.gas == "screen":
+        imgui.separator_text("gas")
+        changed, val = imgui.checkbox("draw as gas  (V)", r.gas_on)
+        if changed:
+            r.gas_on = val
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Draw the stars as one continuous glow rather "
+                              "than as separate points. A galaxy is optically "
+                              "thin, so its light simply adds up along the "
+                              "ray, which is what this does.")
+        imgui.begin_disabled(not r.gas_on)
+        changed, val = imgui.slider_float("softening", r.gas_soft, 0.0, 8.0, "%.2f px")
+        if changed:
+            r.gas_soft = val
+        imgui.end_disabled()
+        imgui.separator_text("")
     imgui.push_item_width(-186)
     changed, val = imgui.slider_float("scale", app.pending_scale, 0.35, 1.0, "%.2f")
     if changed:
@@ -2763,6 +3751,8 @@ def main():
                     app.show_orbits = not app.show_orbits
                 elif ev.key == pygame.K_x:
                     app.spawn_star()
+                elif ev.key == pygame.K_v:
+                    renderer.gas_on = not renderer.gas_on
                 elif ev.key in (pygame.K_RIGHTBRACKET, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     app.sim.speed = min(app.sim.speed * 1.4, 16.0)
                 elif ev.key in (pygame.K_LEFTBRACKET, pygame.K_MINUS, pygame.K_KP_MINUS):
@@ -2824,6 +3814,7 @@ def main():
             app.sim.step()
         positions = pos.to_numpy()[:scene.n]
         app.update_tde(positions)
+        app.update_gas()
 
         impl.process_inputs()
         imgui.new_frame()
@@ -2834,10 +3825,17 @@ def main():
             draw_labels(app, positions)
         imgui.render()
 
-        vcount = scene.n if app.show_heliosphere else scene.n_base
+        # Drawn as gas, the particles that went into the density field must
+        # not also be drawn as sprites.  They are a contiguous block at the
+        # end, so not drawing them is just a shorter draw call.
+        if scene.gas == "volume" and renderer.gas_on:
+            vcount = scene.gas_lo
+        else:
+            vcount = scene.n_base
         _reset_scissor()
         renderer.draw(scene, cam, positions, app.sim.time, app.lensing,
-                      vertex_count=vcount, line_kinds=app.visible_lines())
+                      vertex_count=vcount, line_kinds=app.visible_lines(),
+                      extras=app.extra_ranges())
         impl.render(imgui.get_draw_data())
 
         pygame.display.flip()
