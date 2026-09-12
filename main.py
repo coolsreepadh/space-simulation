@@ -34,7 +34,7 @@ Scenes (number keys, or the Scenes panel)
                               "Solar System" panel
     2  Galaxy Merger          two live bulge+halo disk galaxies on a grazing
                               prograde encounter -- bridge, tidal tails, merger
-    3  Gargantua              a BARE Schwarzschild hole -- press X to drop a
+    3  Black hole (10 M_sun) a BARE Schwarzschild hole -- press X to drop a
                               star on it and watch tides shred it into a
                               stream that circularises into the disk
     4  Star Cluster Collapse  cold Plummer sphere, full O(N^2) self-gravity
@@ -193,9 +193,27 @@ def k_recycle(lo: ti.i32, hi: ti.i32, gm: ti.f32, rs: ti.f32,
             vel[i] = ti.Vector([-vc * ti.sin(ang), 0.0, vc * ti.cos(ang)])
 
 
+# --- physical scale of the hole ---------------------------------------------
+#
+# The black hole scene runs in geometric units: 1 world unit = 1 Schwarzschild
+# radius and c = 1, so GM = r_s / 2 = 0.5.  Schwarzschild dynamics measured in
+# r_s are mass-independent -- a hole of any mass looks identical this way -- so
+# pinning the mass is purely a question of what the units MEAN.  At 10 solar
+# masses one world unit is about 30 km, which is what the readouts convert to.
+
+BH_SOLAR_MASSES = 10.0
+_SOLAR_MASS_KG = 1.98892e30
+_G_SI = 6.67430e-11
+_C_SI = 2.99792458e8
+# r_s = 2GM/c^2, in km
+BH_RS_KM = (2.0 * _G_SI * BH_SOLAR_MASSES * _SOLAR_MASS_KG / (_C_SI ** 2)) / 1000.0
+# the hole is 0.5 in sim mass units, so this converts sim mass -> solar masses
+SIM_MASS_TO_SOLAR = BH_SOLAR_MASSES / 0.5
+
+
 # --- tidal disruption: spawning a star, accreting it, circularising it ------
 #
-# The Gargantua scene starts as a bare hole.  A star is spawned as a live,
+# The black hole scene starts bare.  A star is spawned as a live,
 # self-gravitating Plummer ball parked outside the array's active range until
 # then; self-gravity is what lets it hold together on the way in and then lose
 # to the tide at pericentre, instead of shearing apart from frame one.
@@ -204,6 +222,7 @@ GRAVEYARD = 6.0e4      # where accreted particles are parked: far enough that
                        # the point sprite's distance falloff makes them vanish
 
 _swallowed = ti.field(ti.i32, shape=1)
+_red = ti.Vector.field(4, ti.f32, shape=1)   # (m*vx, m*vy, m*vz, m) accumulator
 
 
 @ti.kernel
@@ -220,23 +239,57 @@ def k_write_block(lo: ti.i32, count: ti.i32,
 
 
 @ti.kernel
-def k_swallow(lo: ti.i32, hi: ti.i32, rs: ti.f32) -> ti.i32:
-    """Anything that crosses the horizon is gone for good -- massless and
-    parked far away.  Unlike the old recycling disk this does NOT re-inject
-    it: the star is being eaten, and running out of star is the point."""
+def k_swallow(lo: ti.i32, hi: ti.i32, rs: ti.f32, sustain: ti.i32,
+              gm: ti.f32, feed_r: ti.f32) -> ti.i32:
+    """Handle whatever reaches the hole.
+
+    With sustain off it is simply gone: massless and parked far away, so the
+    disk drains and the hole eventually finishes its meal.  With sustain on the
+    same material is resupplied at the feed radius on a circular orbit, which
+    is how a real stellar-mass hole keeps a disk at all -- Cygnus X-1 and its
+    kin are fed continuously by a companion, and their disks persist rather
+    than being a one-off meal that empties out.
+    """
     _swallowed[0] = 0
     for i in range(lo, hi):
-        # 2 r_s, not the horizon itself: anything this far inside the 3 r_s
-        # ISCO is on a plunging orbit and is not coming back, and capturing it
-        # here keeps it clear of the radius where the Paczynski-Wiita force
-        # diverges and a finite timestep would fling it back out at absurd speed
-        if mass[i] > 0.0 and pos[i].norm() < 2.0 * rs:
-            mass[i] = 0.0
-            vel[i] = ti.Vector([0.0, 0.0, 0.0])
-            pos[i] = ti.Vector([GRAVEYARD + 3.0 * ti.cast(i % 97, ti.f32),
-                                GRAVEYARD, GRAVEYARD])
+        # 2.5 r_s, not the horizon itself: anything this far inside the 3 r_s
+        # ISCO has no stable orbit left and is already committed to falling in,
+        # and capturing it out here keeps it well clear of the radius where the
+        # Paczynski-Wiita force gets steep enough that a finite timestep would
+        # slingshot it straight back out at escape speed.  Checked every
+        # substep for the same reason -- one frame of travel is enough for a
+        # fast plunging orbit to dive deep between checks.
+        if mass[i] > 0.0 and pos[i].norm() < 2.5 * rs:
             _swallowed[0] += 1
+            if sustain == 1:
+                ang = ti.random() * 6.2831853
+                rr = feed_r * (0.90 + 0.20 * ti.random())
+                pos[i] = ti.Vector([rr * ti.cos(ang),
+                                    (ti.random() - 0.5) * 0.02 * rr,
+                                    rr * ti.sin(ang)])
+                vc = ti.sqrt(gm * rr) / ti.max(rr - rs, 1e-3)
+                vel[i] = ti.Vector([-vc * ti.sin(ang), 0.0, vc * ti.cos(ang)])
+            else:
+                mass[i] = 0.0
+                vel[i] = ti.Vector([0.0, 0.0, 0.0])
+                pos[i] = ti.Vector([GRAVEYARD + 3.0 * ti.cast(i % 97, ti.f32),
+                                    GRAVEYARD, GRAVEYARD])
     return _swallowed[0]
+
+
+@ti.kernel
+def k_balance_momentum(n: ti.i32):
+    """Give the central body the recoil that keeps total momentum at zero.
+
+    With a low-mass star this is a rounding error, but a star heavy enough to
+    matter would otherwise hand the whole system a net drift and walk it out
+    of frame over a few thousand time units."""
+    _red[0] = ti.Vector([0.0, 0.0, 0.0, 0.0])
+    for i in range(1, n):
+        mv = mass[i] * vel[i]
+        _red[0] += ti.Vector([mv[0], mv[1], mv[2], 0.0])
+    if mass[0] > 0.0:
+        vel[0] = -ti.Vector([_red[0][0], _red[0][1], _red[0][2]]) / mass[0]
 
 
 @ti.kernel
@@ -267,9 +320,6 @@ def k_circularise(lo: ti.i32, hi: ti.i32, frac: ti.f32, tang: ti.f32,
             vel[i][1] -= vel[i][1] * (frac * 0.25)
             v_tan = vel[i] - rhat * vel[i].dot(rhat)
             vel[i] -= v_tan * (frac * tang)
-
-
-_red = ti.Vector.field(4, ti.f32, shape=1)   # (m*vx, m*vy, m*vz, m) accumulator
 
 
 @ti.kernel
@@ -1015,23 +1065,27 @@ def preset_galaxy_merger(rng):
 
 
 # ---------------------------------------------------------------------------
-# 3) Gargantua core -- geometric units, 1 world unit == 1 Schwarzschild radius
+# 3) Stellar-mass black hole -- geometric units, 1 world unit == 1 r_s
 # ---------------------------------------------------------------------------
 
-def preset_gargantua(rng):
-    """A bare Schwarzschild hole -- no accretion disk at all until you make one.
+def preset_black_hole(rng):
+    """A bare 10-solar-mass Schwarzschild hole -- no disk until you make one.
 
     Press X (or use the Tidal Disruption panel) to drop a star onto it.  The
-    star is a live, self-gravitating Plummer ball on a bound, highly eccentric
-    orbit whose pericentre sits comfortably inside its own tidal radius, so it
-    survives the fall in, gets stretched into a stream at pericentre, and that
-    stream is what becomes the disk.
+    star is a live, self-gravitating Plummer ball on a bound, eccentric orbit
+    whose pericentre sits inside its own tidal radius, so it survives the fall
+    in, gets stretched into a stream at pericentre, and that stream is what
+    becomes the disk.
 
-    The numbers are picked so the disruption is decisive but not instant:
-    with M_star = 1e-4 and a half-mass radius of ~0.52 r_s, the tidal radius
-    r_t = r_h (M_bh / M_star)^(1/3) works out around 11 r_s, so a pericentre
-    of 8 r_s gives beta = r_t / r_p ~ 1.4 -- a full disruption, while still
-    sitting well outside the 3 r_s ISCO so the core is not simply swallowed.
+    One honest caveat about the star.  Around a hole this small a real star is
+    torn apart tens of thousands of r_s out, far outside anywhere the lensing
+    is visible -- which is exactly why observed tidal disruptions are events
+    around supermassive holes, and why real 10-solar-mass holes (Cygnus X-1
+    and the rest of the X-ray binaries) get their disks from a companion
+    feeding them rather than from one swallowed star.  To put the disruption
+    somewhere you can actually watch it against the photon ring, the star here
+    is deliberately compact for its mass.  "Sustain disk" models the
+    companion-fed case, and is what stops the disk ever emptying out.
     """
     G = 1.0
     rs = 1.0
@@ -1059,7 +1113,7 @@ def preset_gargantua(rng):
     C.extend([[1.0, 0.95, 0.85]] * pool)
     R.extend([0.030] * pool)
 
-    sc = Scene("Gargantua", P, V, M, S, C, R,
+    sc = Scene("Black Hole", P, V, M, S, C, R,
                n_src=1, n_dynamic=1, gconst=G, dt=0.22, substeps=3, pw_rs=rs,
                bh=True, disk_in=3.0, disk_out=26.0, recycle=None,
                cam_dist=34.0, cam_pitch=0.075, cam_yaw=0.6,
@@ -1067,11 +1121,14 @@ def preset_gargantua(rng):
     sc.star_n = star_n
     sc.star_slots = star_slots
     sc.star_cfg = {
-        "m_star": 1.0e-4,    # total stellar mass (G = 1 units)
-        "r_star": 1.0,       # outer radius in r_s
+        # 0.03 sim mass units == 0.6 solar masses, 300x the token star this
+        # scene started with, and enough that the hole's recoil has to be
+        # cancelled explicitly when it is dropped (see k_balance_momentum)
+        "m_star": 0.03,
+        "r_star": 8.0,       # outer radius in r_s -- compact, see the docstring
         "r_apo": 55.0,       # spawn radius: apocentre of the infall orbit
-        "r_peri": 10.0,      # pericentre -- inside the ~11 r_s tidal radius
-        "soft": 0.05,
+        "r_peri": 12.0,      # pericentre, inside the tidal radius
+        "soft": 0.12,
         "gm": gm,
         "rs": rs,
     }
@@ -1134,7 +1191,7 @@ def preset_cluster(rng):
 PRESETS = {
     1: preset_solar_system,
     2: preset_galaxy_merger,
-    3: preset_gargantua,
+    3: preset_black_hole,
     4: preset_cluster,
 }
 
@@ -1914,7 +1971,9 @@ class Sim:
         self.self_gravity = True
         self.viscosity = 0.004      # circularisation rate, 1 / time unit
         self.inflow = 0.015         # fraction of that which removes L (drains the disk)
-        self.visc_radius = 22.0     # only inside here, where the stream piles up
+        self.visc_radius = 26.0     # only inside here, where the stream piles up
+        self.sustain_disk = True    # resupply accreted material, so the disk persists
+        self.feed_radius = 20.0     # where a sustained disk is resupplied
         self.circularising = False  # switched on once the star reaches pericentre
 
     def load(self, key):
@@ -1955,6 +2014,7 @@ class Sim:
         s.n_dynamic = max(s.n_dynamic, live)
         s.n_base = s.n_dynamic + s.n_sat
         s.n_src = s.n_dynamic if self.self_gravity else 1
+        k_balance_momentum(s.n_dynamic)
         k_accel(s.n_dynamic, s.n_src, s.gconst, s.pw_rs)
         return True
 
@@ -1963,16 +2023,28 @@ class Sim:
         dt = s.dt * self.speed
         if s.star_n:
             s.n_src = s.n_dynamic if self.self_gravity else 1
+        eating = bool(s.star_n) and s.n_dynamic > 1
         for _ in range(s.substeps):
             k_kick(s.n_dynamic, 0.5 * dt)
             k_drift(s.n_dynamic, dt)
             k_accel(s.n_dynamic, s.n_src, s.gconst, s.pw_rs)
             k_kick(s.n_dynamic, 0.5 * dt)
             self.time += dt
+            if eating:
+                s.accreted += k_swallow(1, s.n_dynamic, s.pw_rs,
+                                        1 if self.sustain_disk else 0,
+                                        s.gconst * s.mass[0], self.feed_radius)
         if s.n_sat > 0:
             k_update_satellites(s.n_dynamic, s.n_sat, self.time)
-        if s.star_n and s.n_dynamic > 1:
-            s.accreted += k_swallow(1, s.n_dynamic, s.pw_rs)
+        if eating:
+            # Neither the viscous damping nor the resupply teleport conserves
+            # momentum, and with a star heavy enough to matter that leak is
+            # enough to walk the hole clean out of its own disk over a few
+            # thousand time units -- which then scatters the disk. Pinning the
+            # total momentum to zero every frame keeps the hole where the disk
+            # is; with momentum conserved this is exactly what the hole's
+            # velocity would have been anyway.
+            k_balance_momentum(s.n_dynamic)
             if self.viscosity > 0.0 and self.circularising:
                 frac = 1.0 - math.exp(-self.viscosity * dt * s.substeps)
                 k_circularise(1, s.n_dynamic, frac, self.inflow,
@@ -2091,10 +2163,14 @@ class App:
         tgt_bright, tgt_in, tgt_out = 0.0, s.disk_in, s.disk_out
         if cnt > 60:
             rr = r_alive[disky]
+            # 75th percentile, not 90th: a long-lived disk always has some
+            # scattered material way out past the body of it, and letting that
+            # set the outer edge inflates the drawn disk until it swallows the
+            # frame and flattens the temperature gradient across it
             self.debris_inner = float(np.percentile(rr, 8))
-            self.debris_outer = float(np.percentile(rr, 90))
+            self.debris_outer = float(np.percentile(rr, 70))
             tgt_in = min(max(self.debris_inner, 2.2), 18.0)
-            tgt_out = min(max(self.debris_outer, tgt_in + 3.0), 60.0)
+            tgt_out = min(max(self.debris_outer, tgt_in + 3.0), 28.0)
             tgt_bright = self.disk_peak * min(1.0, self.debris_frac / 0.35)
 
         if self.auto_disk:
@@ -2133,7 +2209,7 @@ class App:
 SCENE_NAMES = {
     1: "1  Solar System disk",
     2: "2  Galaxy Merger",
-    3: "3  Gargantua black hole",
+    3: "3  Black hole  (10 M_sun)",
     4: "4  Star Cluster Collapse",
 }
 
@@ -2301,9 +2377,10 @@ def draw_gui(app):
         r.spin = 1.0 if val else -1.0
     imgui.end_disabled()
     imgui.separator_text("geometry")
-    imgui.text(f"horizon      1.00 r_s")
-    imgui.text(f"photon ring  1.50 r_s")
-    imgui.text(f"ISCO         3.00 r_s")
+    imgui.text(f"mass         {BH_SOLAR_MASSES:.0f} M_sun")
+    imgui.text(f"horizon      1.00 r_s  ({BH_RS_KM:6.1f} km)")
+    imgui.text(f"photon ring  1.50 r_s  ({1.5 * BH_RS_KM:6.1f} km)")
+    imgui.text(f"ISCO         3.00 r_s  ({3.0 * BH_RS_KM:6.1f} km)")
     imgui.text(f"camera       {cam.dist / max(scene.world_rs, 1e-6):8.2f} r_s")
     imgui.pop_item_width()
     imgui.end()
@@ -2321,10 +2398,11 @@ def draw_gui(app):
     if imgui.button("Spawn star  (X)", imgui.ImVec2(-1, 0)):
         app.spawn_star()
     cfg = scene.star_cfg or {"m_star": 0.0, "r_star": 0.0, "r_peri": 0.0, "r_apo": 0.0}
-    changed, val = imgui.slider_float("star mass", cfg["m_star"] * 1e4, 0.2, 5.0, "%.2f e-4")
+    changed, val = imgui.slider_float("star mass", cfg["m_star"] * SIM_MASS_TO_SOLAR,
+                                      0.05, 4.0, "%.2f M_sun")
     if changed:
-        cfg["m_star"] = val * 1e-4
-    changed, val = imgui.slider_float("star radius", cfg["r_star"], 0.3, 2.0, "%.2f r_s")
+        cfg["m_star"] = val / SIM_MASS_TO_SOLAR
+    changed, val = imgui.slider_float("star radius", cfg["r_star"], 0.5, 10.0, "%.2f r_s")
     if changed:
         cfg["r_star"] = val
     changed, val = imgui.slider_float("pericentre", cfg["r_peri"], 3.5, 30.0, "%.1f r_s")
@@ -2344,6 +2422,13 @@ def draw_gui(app):
         imgui.text_colored(col, f"beta = r_t/r_p = {beta:4.2f}  {verdict}")
 
     imgui.separator_text("debris")
+    changed, val = imgui.checkbox("sustain disk (companion feed)", sim.sustain_disk)
+    if changed:
+        sim.sustain_disk = val
+    if sim.sustain_disk:
+        changed, val = imgui.slider_float("feed radius", sim.feed_radius, 8.0, 45.0, "%.1f r_s")
+        if changed:
+            sim.feed_radius = val
     changed, val = imgui.checkbox("self-gravity", sim.self_gravity)
     if changed:
         sim.self_gravity = val
@@ -2357,7 +2442,7 @@ def draw_gui(app):
     if changed:
         sim.inflow = val
     imgui.text(f"stars dropped  {scene.star_spawned:6d}")
-    imgui.text(f"accreted       {scene.accreted:6d}")
+    imgui.text(f"{'recycled' if sim.sustain_disk else 'accreted':<14s} {scene.accreted:6d}")
     imgui.text(f"bound fraction {app.debris_frac * 100.0:5.1f} %")
     if app.debris_outer > 0.0:
         imgui.text(f"debris  {app.debris_inner:5.1f} - {app.debris_outer:5.1f} r_s")
@@ -2462,7 +2547,7 @@ def main():
         pygame.display.set_mode((w, h), flags, vsync=ARGS.vsync)
     except pygame.error:
         pygame.display.set_mode((w, h), flags)
-    pygame.display.set_caption("N-Body Universe + Ray-Marched Gargantua")
+    pygame.display.set_caption("N-Body Universe + Ray-Marched Black Hole")
 
     ctx = moderngl.create_context()
     renderer = Renderer(ctx, (w, h), ARGS.scale)
