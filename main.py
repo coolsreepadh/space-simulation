@@ -240,7 +240,8 @@ def k_write_block(lo: ti.i32, count: ti.i32,
 
 @ti.kernel
 def k_swallow(lo: ti.i32, hi: ti.i32, rs: ti.f32, sustain: ti.i32,
-              gm: ti.f32, feed_r: ti.f32) -> ti.i32:
+              gm: ti.f32, feed_r: ti.f32, r_return: ti.f32,
+              jet_range: ti.f32) -> ti.i32:
     """Handle whatever reaches the hole.
 
     With sustain off it is simply gone: massless and parked far away, so the
@@ -252,6 +253,23 @@ def k_swallow(lo: ti.i32, hi: ti.i32, rs: ti.f32, sustain: ti.i32,
     """
     _swallowed[0] = 0
     for i in range(lo, hi):
+        # Anything flung far out is brought back rather than written off.  A
+        # little material always gets scattered onto an escaping orbit, and
+        # without this the disk quietly bleeds particles for the whole run
+        # instead of staying put.
+        r_i = pos[i].norm()
+        limit = r_return
+        if abs(pos[i][1]) > 0.45 * r_i:
+            limit = jet_range      # jet material loops back sooner, keeping the
+                                   # beam short and dense enough to read as one
+        if sustain == 1 and mass[i] > 0.0 and r_i > limit:
+            ang = ti.random() * 6.2831853
+            rr = feed_r * (0.90 + 0.20 * ti.random())
+            pos[i] = ti.Vector([rr * ti.cos(ang),
+                                (ti.random() - 0.5) * 0.02 * rr,
+                                rr * ti.sin(ang)])
+            vc = ti.sqrt(gm * rr) / ti.max(rr - rs, 1e-3)
+            vel[i] = ti.Vector([-vc * ti.sin(ang), 0.0, vc * ti.cos(ang)])
         # 2.5 r_s, not the horizon itself: anything this far inside the 3 r_s
         # ISCO has no stable orbit left and is already committed to falling in,
         # and capturing it out here keeps it well clear of the radius where the
@@ -275,6 +293,36 @@ def k_swallow(lo: ti.i32, hi: ti.i32, rs: ti.f32, sustain: ti.i32,
                 pos[i] = ti.Vector([GRAVEYARD + 3.0 * ti.cast(i % 97, ti.f32),
                                     GRAVEYARD, GRAVEYARD])
     return _swallowed[0]
+
+
+@ti.kernel
+def k_jet(lo: ti.i32, hi: ti.i32, rate: ti.f32, r_source: ti.f32,
+          v_jet: ti.f32, spread: ti.f32, base: ti.f32, rs: ti.f32):
+    """Launch a trickle of disk material back out along the poles.
+
+    Jetted tidal disruptions are a real if uncommon class -- Swift J1644+57 is
+    the famous one -- and the twin beams perpendicular to the disk are the most
+    recognisable thing about the artist renderings of them.
+
+    Material is drawn from anywhere in the disk body but always launched from
+    the axis just above the hole, which is an idealisation: drawing only from
+    the handful of particles that happen to be at the launch radius leaves the
+    beam far too sparse to read as a beam, and launching from wherever they
+    already were gives a broad fountain rather than a collimated jet.  What it
+    costs the disk is returned -- k_swallow brings the material back once it
+    coasts past the return radius -- so the jet is a loop, not a leak.
+    """
+    for i in range(lo, hi):
+        r = pos[i].norm()
+        if mass[i] >= 0.0 and r > 2.0 * rs and r < r_source and ti.random() < rate:
+            sign = 1.0
+            if ti.random() < 0.5:
+                sign = -1.0
+            ang = ti.random() * 6.2831853
+            rad = 0.55 * ti.sqrt(ti.random())
+            pos[i] = ti.Vector([rad * ti.cos(ang), sign * base, rad * ti.sin(ang)])
+            lat = spread * v_jet * ti.sqrt(ti.random())
+            vel[i] = ti.Vector([lat * ti.cos(ang), sign * v_jet, lat * ti.sin(ang)])
 
 
 @ti.kernel
@@ -313,7 +361,10 @@ def k_circularise(lo: ti.i32, hi: ti.i32, frac: ti.f32, tang: ti.f32,
     """
     for i in range(lo, hi):
         r = pos[i].norm()
-        if r < r_max and r > 1.5 * rs:
+        # |y| < 0.3 r keeps this to material that is actually in the disk --
+        # jet particles climbing out along the poles must not be dragged back
+        # down into the plane by it
+        if r < r_max and r > 1.5 * rs and abs(pos[i][1]) < 0.3 * r:
             rhat = pos[i] / r
             vr = vel[i].dot(rhat)
             vel[i] -= rhat * (vr * frac)
@@ -1091,7 +1142,8 @@ def preset_black_hole(rng):
     rs = 1.0
     gm = 0.5 * rs            # c = 1 and r_s = 2GM, so GM = r_s / 2
 
-    star_n = 3000            # particles per star
+    star_n = 5000            # particles per star -- a denser stream reads
+                             # as a stream rather than a spray
     star_slots = 3           # stars that can be on the board at once
 
     P = [[0.0, 0.0, 0.0]]
@@ -1121,14 +1173,11 @@ def preset_black_hole(rng):
     sc.star_n = star_n
     sc.star_slots = star_slots
     sc.star_cfg = {
-        # 0.03 sim mass units == 0.6 solar masses, 300x the token star this
-        # scene started with, and enough that the hole's recoil has to be
-        # cancelled explicitly when it is dropped (see k_balance_momentum)
-        "m_star": 0.03,
-        "r_star": 8.0,       # outer radius in r_s -- compact, see the docstring
-        "r_apo": 55.0,       # spawn radius: apocentre of the infall orbit
+        "m_star": 1.0e-3,
+        "r_star": 2.5,       # outer radius in r_s -- see the docstring
+        "r_apo": 65.0,       # spawn radius: apocentre of the infall orbit
         "r_peri": 12.0,      # pericentre, inside the tidal radius
-        "soft": 0.12,
+        "soft": 0.06,
         "gm": gm,
         "rs": rs,
     }
@@ -1408,6 +1457,9 @@ uniform float u_diskIn, u_diskOut;
 uniform int u_steps;
 uniform float u_diskBright;
 uniform float u_spin;        // +-1, sense of disk rotation
+uniform float u_jetBright;   // 0 = no jet
+uniform float u_jetLen;      // how far the beams reach, in r_s
+uniform float u_jetRad;      // beam radius at the base
 
 __COMMON__
 
@@ -1482,6 +1534,29 @@ void main() {
         vec3 accNew = -1.5 * h2 * p / pow(dot(p, p), 2.5);
         v += 0.5 * (acc + accNew) * dt;
         acc = accNew;
+
+        // --- polar jets ---------------------------------------------------
+        // Accumulated as a volume along the ray rather than drawn as
+        // particles: a beam made of points stays a dotted line no matter how
+        // many you throw at it, where an emissive volume actually glows -- and
+        // being integrated inside the geodesic march, it gets lensed with
+        // everything else.
+        if (u_jetBright > 0.0) {
+            vec3 mid = mix(pPrev, p, 0.5);
+            float ay = abs(mid.y);
+            if (ay > 1.1 && ay < u_jetLen) {
+                float h = ay / u_jetLen;
+                float cone = u_jetRad * (0.35 + 3.20 * h);   // widens with height
+                float rxz = length(mid.xz);
+                if (rxz < cone) {
+                    float prof = 1.0 - rxz / cone;
+                    float turb = fbm(vec3(mid.xz * 0.9, ay * 0.22 - u_time * 0.5), 3);
+                    vec3 jcol = mix(vec3(0.45, 0.70, 1.35), vec3(1.00, 0.72, 1.20), turb);
+                    float glow = prof * prof * exp(-h * 1.35) * (0.50 + 0.85 * turb);
+                    col += trans * jcol * glow * u_jetBright * dt;
+                }
+            }
+        }
 
         // --- equatorial disk crossing -----------------------------------
         if (pPrev.y * p.y < 0.0) {
@@ -1741,6 +1816,9 @@ class Renderer:
         self.particle_gain = 1.0
         self.steps = ARGS.steps
         self.spin = -1.0          # matches the sense the N-body disk orbits in
+        self.jet_bright = 0.0     # volumetric polar jets, driven by the App
+        self.jet_len = 55.0
+        self.jet_rad = 2.6
 
         quad = np.array([-1, -1, 3, -1, -1, 3], dtype="f4")
         self.quad_vbo = ctx.buffer(quad.tobytes())
@@ -1909,6 +1987,9 @@ class Renderer:
             setu(g, "u_steps", self.steps)
             setu(g, "u_diskBright", self.disk_bright)
             setu(g, "u_spin", self.spin)
+            setu(g, "u_jetBright", self.jet_bright)
+            setu(g, "u_jetLen", self.jet_len)
+            setu(g, "u_jetRad", self.jet_rad)
             self._blit(g)
         else:
             g = self.prog_flat
@@ -1969,11 +2050,27 @@ class Sim:
         self.rng = np.random.default_rng()
         # tidal-disruption controls
         self.self_gravity = True
-        self.viscosity = 0.004      # circularisation rate, 1 / time unit
-        self.inflow = 0.015         # fraction of that which removes L (drains the disk)
+        self.viscosity = 0.0025     # circularisation rate, 1 / time unit -- low
+                                    # enough that the debris stream stays a
+                                    # visible stream for a good while before it
+                                    # settles into the disk
+        self.inflow = 0.055         # fraction of that which removes L: sets how
+                                    # fast material spirals in. With sustain on this
+                                    # is throughput, not loss -- what reaches the
+                                    # hole is resupplied, so the disk is a steady
+                                    # state rather than a dwindling one.
         self.visc_radius = 26.0     # only inside here, where the stream piles up
         self.sustain_disk = True    # resupply accreted material, so the disk persists
         self.feed_radius = 20.0     # where a sustained disk is resupplied
+        self.return_radius = 150.0  # past here, scattered material is brought back
+        self.star_intact = False    # self-gravity only matters while a star is whole
+        self.jet = True             # twin polar jets off the inner disk
+        self.jet_rate = 0.0018      # per-frame chance a disk particle is launched
+        self.jet_range = 55.0       # jet material is returned to the disk past here
+        self.jet_source = 16.0      # jets are fed from inside this radius
+        self.jet_base = 2.6         # launch height above the hole
+        self.jet_speed = 0.85       # launch speed (c = 1), above local escape
+        self.jet_spread = 0.09      # opening angle as a fraction of jet speed
         self.circularising = False  # switched on once the star reaches pericentre
 
     def load(self, key):
@@ -1994,6 +2091,7 @@ class Sim:
         k_accel(s.n_dynamic, s.n_src, s.gconst, s.pw_rs)
         self.time = 0.0
         self.circularising = False
+        self.star_intact = False
         return s
 
     def spawn_star(self, azimuth=0.5 * math.pi):
@@ -2013,6 +2111,7 @@ class Sim:
         live = 1 + min(s.star_spawned, s.star_slots) * s.star_n
         s.n_dynamic = max(s.n_dynamic, live)
         s.n_base = s.n_dynamic + s.n_sat
+        self.star_intact = True
         s.n_src = s.n_dynamic if self.self_gravity else 1
         k_balance_momentum(s.n_dynamic)
         k_accel(s.n_dynamic, s.n_src, s.gconst, s.pw_rs)
@@ -2022,7 +2121,11 @@ class Sim:
         s = self.scene
         dt = s.dt * self.speed
         if s.star_n:
-            s.n_src = s.n_dynamic if self.self_gravity else 1
+            # Self-gravity is only what holds a star together on the way in;
+            # once it is a spread-out debris stream the hole dominates utterly,
+            # so dropping back to a single source afterwards costs nothing
+            # physically and takes the cost from O(N^2) to O(N).
+            s.n_src = s.n_dynamic if (self.self_gravity and self.star_intact) else 1
         eating = bool(s.star_n) and s.n_dynamic > 1
         for _ in range(s.substeps):
             k_kick(s.n_dynamic, 0.5 * dt)
@@ -2033,7 +2136,8 @@ class Sim:
             if eating:
                 s.accreted += k_swallow(1, s.n_dynamic, s.pw_rs,
                                         1 if self.sustain_disk else 0,
-                                        s.gconst * s.mass[0], self.feed_radius)
+                                        s.gconst * s.mass[0], self.feed_radius,
+                                        self.return_radius, self.jet_range)
         if s.n_sat > 0:
             k_update_satellites(s.n_dynamic, s.n_sat, self.time)
         if eating:
@@ -2049,6 +2153,9 @@ class Sim:
                 frac = 1.0 - math.exp(-self.viscosity * dt * s.substeps)
                 k_circularise(1, s.n_dynamic, frac, self.inflow,
                               self.visc_radius, s.pw_rs)
+            if self.jet and self.circularising:
+                k_jet(1, s.n_dynamic, self.jet_rate, self.jet_source,
+                      self.jet_speed, self.jet_spread, self.jet_base, s.pw_rs)
         if s.recycle is not None:
             lo, hi = s.recycle
             k_recycle(lo, hi, s.gconst * s.mass[0], s.pw_rs,
@@ -2109,6 +2216,7 @@ class App:
         self.mission_on = {}   # mission name -> bool, populated fresh per scene
         self.auto_disk = True  # let the ray-marched disk grow in from the debris
         self.disk_peak = 2.1   # brightness the emergent disk builds up to
+        self.jet_peak = 0.38   # brightness the polar jets build up to
         self.debris_inner = 0.0
         self.debris_outer = 0.0
         self.debris_frac = 0.0
@@ -2122,6 +2230,7 @@ class App:
         if self.scene.star_n:
             # a bare hole: nothing to light up until a star has been torn apart
             self.renderer.disk_bright = 0.0
+            self.renderer.jet_bright = 0.0
             self.scene.disk_in, self.scene.disk_out = 3.0, 26.0
         return self.scene
 
@@ -2143,7 +2252,10 @@ class App:
 
         r_alive = rad[alive]
         if not sim.circularising and r_alive.min() < 1.35 * s.star_cfg["r_peri"]:
-            sim.circularising = True     # pericentre reached: the stream is forming
+            # pericentre reached: the stream is forming, and the star is no
+            # longer a star that needs its own gravity to stay whole
+            sim.circularising = True
+            sim.star_intact = False
 
         # "Disk-like" means on a near-circular orbit, not merely nearby: an
         # intact star coasting through apocentre has little radial motion too,
@@ -2169,7 +2281,12 @@ class App:
             # frame and flattens the temperature gradient across it
             self.debris_inner = float(np.percentile(rr, 8))
             self.debris_outer = float(np.percentile(rr, 70))
-            tgt_in = min(max(self.debris_inner, 2.2), 18.0)
+            # Pinned near the ISCO rather than following the debris.  Inside
+            # the ISCO material plunges in a few orbits, so the particles there
+            # are always sparse -- but a real disk still radiates right down to
+            # it, and letting the drawn inner edge drift out to where the
+            # particles thin out leaves an obvious empty ring around the hole.
+            tgt_in = 3.2
             tgt_out = min(max(self.debris_outer, tgt_in + 3.0), 28.0)
             tgt_bright = self.disk_peak * min(1.0, self.debris_frac / 0.35)
 
@@ -2180,6 +2297,10 @@ class App:
             r.disk_bright += (tgt_bright - r.disk_bright) * k
             s.disk_in += (tgt_in - s.disk_in) * k
             s.disk_out += (tgt_out - s.disk_out) * k
+        # the jets are powered by accretion, so they light up with the disk
+        tgt_jet = self.jet_peak if (sim.jet and sim.circularising) else 0.0
+        tgt_jet *= min(1.0, self.debris_frac / 0.35)
+        r.jet_bright += (tgt_jet - r.jet_bright) * 0.02
 
         # re-tint by depth in the potential: a star still on its way in stays
         # stellar warm-white, debris shock-heats and brightens as it spirals in
@@ -2187,7 +2308,14 @@ class App:
         hot = np.array([1.00, 0.93, 0.88])[None, :]
         cool = np.array([1.00, 0.80, 0.58])[None, :]
         boost = (0.85 + 1.10 * (1.0 - t) ** 2)
-        s.attrib[1:s.n_dynamic, 0:3] = (hot * (1.0 - t) + cool * t) * boost
+        col = (hot * (1.0 - t) + cool * t) * boost
+        # anything well off the disk plane is in a jet: give the beams their own
+        # hot blue-white so they separate from the disk instead of reading as
+        # stray debris
+        jetting = np.abs(deb[:, 1]) > 0.45 * np.maximum(rad, 1e-6)
+        col[jetting] = np.array([0.72, 0.86, 1.25])
+        s.attrib[1:s.n_dynamic, 0:3] = col
+        s.attrib[1:s.n_dynamic, 3] = np.where(jetting, 0.055, 0.030)
         r.update_attrib(s, 1, s.n_dynamic)
 
     def spawn_star(self):
@@ -2387,7 +2515,7 @@ def draw_gui(app):
 
     # --- tidal disruption ----------------------------------------------------
     imgui.set_next_window_pos(imgui.ImVec2(360, 12), imgui.Cond_.first_use_ever)
-    imgui.set_next_window_size(imgui.ImVec2(336, 400), imgui.Cond_.first_use_ever)
+    imgui.set_next_window_size(imgui.ImVec2(336, 610), imgui.Cond_.first_use_ever)
     imgui.begin("Tidal Disruption")
     sim = app.sim
     if not scene.star_n:
@@ -2441,6 +2569,22 @@ def draw_gui(app):
     changed, val = imgui.slider_float("accretion rate", sim.inflow, 0.0, 0.10, "%.3f")
     if changed:
         sim.inflow = val
+    imgui.separator_text("polar jets")
+    changed, val = imgui.checkbox("twin jets", sim.jet)
+    if changed:
+        sim.jet = val
+    imgui.begin_disabled(not sim.jet)
+    changed, val = imgui.slider_float("jet power", app.jet_peak, 0.0, 1.2, "%.2f")
+    if changed:
+        app.jet_peak = val
+    changed, val = imgui.slider_float("jet reach", app.renderer.jet_len, 15.0, 120.0, "%.0f r_s")
+    if changed:
+        app.renderer.jet_len = val
+        sim.jet_range = val
+    changed, val = imgui.slider_float("jet width", app.renderer.jet_rad, 0.6, 6.0, "%.2f r_s")
+    if changed:
+        app.renderer.jet_rad = val
+    imgui.end_disabled()
     imgui.text(f"stars dropped  {scene.star_spawned:6d}")
     imgui.text(f"{'recycled' if sim.sustain_disk else 'accreted':<14s} {scene.accreted:6d}")
     imgui.text(f"bound fraction {app.debris_frac * 100.0:5.1f} %")
@@ -2452,8 +2596,8 @@ def draw_gui(app):
     imgui.end()
 
     # --- solar system overlays ----------------------------------------------
-    imgui.set_next_window_pos(imgui.ImVec2(360, 424), imgui.Cond_.first_use_ever)
-    imgui.set_next_window_size(imgui.ImVec2(336, 330), imgui.Cond_.first_use_ever)
+    imgui.set_next_window_pos(imgui.ImVec2(360, 634), imgui.Cond_.first_use_ever)
+    imgui.set_next_window_size(imgui.ImVec2(336, 250), imgui.Cond_.first_use_ever)
     imgui.begin("Solar System")
     is_ss = scene.name == "Solar System"
     if not is_ss:
