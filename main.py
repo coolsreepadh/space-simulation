@@ -34,7 +34,9 @@ Scenes (number keys, or the Scenes panel)
                               "Solar System" panel
     2  Galaxy Merger          two live bulge+halo disk galaxies on a grazing
                               prograde encounter -- bridge, tidal tails, merger
-    3  Gargantua              Paczynski-Wiita accretion disk + lensing shader
+    3  Gargantua              a BARE Schwarzschild hole -- press X to drop a
+                              star on it and watch tides shred it into a
+                              stream that circularises into the disk
     4  Star Cluster Collapse  cold Plummer sphere, full O(N^2) self-gravity
 
 Controls
@@ -47,6 +49,7 @@ Controls
     SPACE        pause                   [ / ]     slower / faster
     L            toggle lensing          F         reset view
     N            toggle body names       O         toggle orbit paths
+    X            spawn a star (scene 3)
     G            hide/show panels        F11       fullscreen
     ESC          quit
 
@@ -154,7 +157,7 @@ def k_accel(n: ti.i32, n_src: ti.i32, gconst: ti.f32, pw_rs: ti.f32):
             r = ti.sqrt(r2)
             f = gconst * mass[j] / (r2 * r)
             if pw_rs > 0.0 and j == 0:
-                rr = ti.max(r - pw_rs, 0.05 * pw_rs)
+                rr = ti.max(r - pw_rs, 0.35 * pw_rs)
                 f = gconst * mass[j] / (rr * rr * r)
             a += f * d
         acc[i] = a
@@ -188,6 +191,82 @@ def k_recycle(lo: ti.i32, hi: ti.i32, gm: ti.f32, rs: ti.f32,
             vc = ti.sqrt(gm * rr) / ti.max(rr - rs, 1e-3)
             vc *= 0.995 + 0.01 * ti.random()
             vel[i] = ti.Vector([-vc * ti.sin(ang), 0.0, vc * ti.cos(ang)])
+
+
+# --- tidal disruption: spawning a star, accreting it, circularising it ------
+#
+# The Gargantua scene starts as a bare hole.  A star is spawned as a live,
+# self-gravitating Plummer ball parked outside the array's active range until
+# then; self-gravity is what lets it hold together on the way in and then lose
+# to the tide at pericentre, instead of shearing apart from frame one.
+
+GRAVEYARD = 6.0e4      # where accreted particles are parked: far enough that
+                       # the point sprite's distance falloff makes them vanish
+
+_swallowed = ti.field(ti.i32, shape=1)
+
+
+@ti.kernel
+def k_write_block(lo: ti.i32, count: ti.i32,
+                  p: ti.types.ndarray(), v: ti.types.ndarray(),
+                  m: ti.types.ndarray(), s: ti.types.ndarray()):
+    for k in range(count):
+        i = lo + k
+        pos[i] = ti.Vector([p[k, 0], p[k, 1], p[k, 2]])
+        vel[i] = ti.Vector([v[k, 0], v[k, 1], v[k, 2]])
+        acc[i] = ti.Vector([0.0, 0.0, 0.0])
+        mass[i] = m[k]
+        sft2[i] = ti.max(s[k] * s[k], MIN_SOFT2)
+
+
+@ti.kernel
+def k_swallow(lo: ti.i32, hi: ti.i32, rs: ti.f32) -> ti.i32:
+    """Anything that crosses the horizon is gone for good -- massless and
+    parked far away.  Unlike the old recycling disk this does NOT re-inject
+    it: the star is being eaten, and running out of star is the point."""
+    _swallowed[0] = 0
+    for i in range(lo, hi):
+        # 2 r_s, not the horizon itself: anything this far inside the 3 r_s
+        # ISCO is on a plunging orbit and is not coming back, and capturing it
+        # here keeps it clear of the radius where the Paczynski-Wiita force
+        # diverges and a finite timestep would fling it back out at absurd speed
+        if mass[i] > 0.0 and pos[i].norm() < 2.0 * rs:
+            mass[i] = 0.0
+            vel[i] = ti.Vector([0.0, 0.0, 0.0])
+            pos[i] = ti.Vector([GRAVEYARD + 3.0 * ti.cast(i % 97, ti.f32),
+                                GRAVEYARD, GRAVEYARD])
+            _swallowed[0] += 1
+    return _swallowed[0]
+
+
+@ti.kernel
+def k_circularise(lo: ti.i32, hi: ti.i32, frac: ti.f32, tang: ti.f32,
+                  r_max: ti.f32, rs: ti.f32):
+    """Stand-in for the viscous dissipation a collisionless N-body cannot have.
+
+    Real tidal debris only settles into a disk because the returning stream
+    shocks against itself and radiates the energy away; with no dissipation at
+    all the stream just precesses forever into an eccentric fan.  Two separate
+    effects, because they do different jobs:
+
+      * damping the radial (and vertical) component at fixed angular momentum
+        drives an eccentric orbit onto the circular one carrying the same L --
+        this is what turns the stream into a disk;
+      * bleeding a much smaller slice off the tangential component removes L,
+        which is what makes the disk spread inward and actually drain into the
+        hole.  Without it the debris circularises into a dead static ring at
+        whatever radius its angular momentum happens to match, and the hole
+        never gets to eat.
+    """
+    for i in range(lo, hi):
+        r = pos[i].norm()
+        if r < r_max and r > 1.5 * rs:
+            rhat = pos[i] / r
+            vr = vel[i].dot(rhat)
+            vel[i] -= rhat * (vr * frac)
+            vel[i][1] -= vel[i][1] * (frac * 0.25)
+            v_tan = vel[i] - rhat * vel[i].dot(rhat)
+            vel[i] -= v_tan * (frac * tang)
 
 
 _red = ti.Vector.field(4, ti.f32, shape=1)   # (m*vx, m*vy, m*vz, m) accumulator
@@ -321,6 +400,16 @@ class Scene:
         # orbit and mission-path polylines: dicts with pos (N,3) f32, color
         # (r,g,b), kind ("orbit" | "mission"), name
         self.polylines = list(polylines) if polylines else []
+
+        # Tidal-disruption state, filled in by the Gargantua preset.  The star
+        # pool lives at [1, 1 + star_slots * star_n) but stays outside
+        # n_dynamic -- and so outside gravity AND outside the draw call --
+        # until a star is actually spawned into it.
+        self.star_n = 0          # particles per star
+        self.star_slots = 0      # how many stars can exist at once
+        self.star_spawned = 0    # how many have been spawned so far
+        self.star_cfg = None     # dict of physical parameters for a new star
+        self.accreted = 0        # particles the hole has eaten
 
 
 def _sphere_dirs(n, rng):
@@ -930,11 +1019,26 @@ def preset_galaxy_merger(rng):
 # ---------------------------------------------------------------------------
 
 def preset_gargantua(rng):
+    """A bare Schwarzschild hole -- no accretion disk at all until you make one.
+
+    Press X (or use the Tidal Disruption panel) to drop a star onto it.  The
+    star is a live, self-gravitating Plummer ball on a bound, highly eccentric
+    orbit whose pericentre sits comfortably inside its own tidal radius, so it
+    survives the fall in, gets stretched into a stream at pericentre, and that
+    stream is what becomes the disk.
+
+    The numbers are picked so the disruption is decisive but not instant:
+    with M_star = 1e-4 and a half-mass radius of ~0.52 r_s, the tidal radius
+    r_t = r_h (M_bh / M_star)^(1/3) works out around 11 r_s, so a pericentre
+    of 8 r_s gives beta = r_t / r_p ~ 1.4 -- a full disruption, while still
+    sitting well outside the 3 r_s ISCO so the core is not simply swallowed.
+    """
     G = 1.0
     rs = 1.0
     gm = 0.5 * rs            # c = 1 and r_s = 2GM, so GM = r_s / 2
-    r_in, r_out = 3.0, 26.0  # 3 r_s is the Schwarzschild ISCO
-    n_disk = 9000
+
+    star_n = 3000            # particles per star
+    star_slots = 3           # stars that can be on the board at once
 
     P = [[0.0, 0.0, 0.0]]
     V = [[0.0, 0.0, 0.0]]
@@ -943,31 +1047,63 @@ def preset_gargantua(rng):
     C = [[0.0, 0.0, 0.0]]
     R = [0.0]                # the hole itself is drawn by the ray marcher
 
-    u = rng.uniform(0.0, 1.0, n_disk)
-    r = r_in + (r_out - r_in) * u ** 0.62
-    ph = rng.uniform(0, 2 * math.pi, n_disk)
-    z = rng.normal(0.0, 0.035, n_disk) * r ** 0.6
-    # Paczynski-Wiita circular speed:  v_c^2 = GM r / (r - r_s)^2
-    vc = np.sqrt(gm * r) / (r - rs)
-    vc *= 1.0 + rng.normal(0.0, 0.012, n_disk)
+    # The dormant star pool.  Parked out at the graveyard radius so that even
+    # if something draws them they are far past the point where a point sprite
+    # fades to nothing; they carry no mass and sit outside n_dynamic, so they
+    # are inert until spawned.
+    pool = star_n * star_slots
+    P.extend([[GRAVEYARD, GRAVEYARD, GRAVEYARD]] * pool)
+    V.extend([[0.0, 0.0, 0.0]] * pool)
+    M.extend([0.0] * pool)
+    S.extend([0.05] * pool)
+    C.extend([[1.0, 0.95, 0.85]] * pool)
+    R.extend([0.030] * pool)
 
-    P.extend(np.stack([r * np.cos(ph), z, r * np.sin(ph)], axis=1).tolist())
-    V.extend(np.stack([-vc * np.sin(ph), np.zeros(n_disk), vc * np.cos(ph)],
-                      axis=1).tolist())
-    M.extend([0.0] * n_disk); S.extend([0.02] * n_disk)
+    sc = Scene("Gargantua", P, V, M, S, C, R,
+               n_src=1, n_dynamic=1, gconst=G, dt=0.22, substeps=3, pw_rs=rs,
+               bh=True, disk_in=3.0, disk_out=26.0, recycle=None,
+               cam_dist=34.0, cam_pitch=0.075, cam_yaw=0.6,
+               fov=42.0, gain=0.8, world_rs=rs, kill_drift=False)
+    sc.star_n = star_n
+    sc.star_slots = star_slots
+    sc.star_cfg = {
+        "m_star": 1.0e-4,    # total stellar mass (G = 1 units)
+        "r_star": 1.0,       # outer radius in r_s
+        "r_apo": 55.0,       # spawn radius: apocentre of the infall orbit
+        "r_peri": 10.0,      # pericentre -- inside the ~11 r_s tidal radius
+        "soft": 0.05,
+        "gm": gm,
+        "rs": rs,
+    }
+    return sc
 
-    t = np.clip((r - r_in) / (r_out - r_in), 0.0, 1.0)[:, None]
-    hot = np.array([1.00, 0.95, 0.95])[None, :]
-    cool = np.array([1.00, 0.42, 0.10])[None, :]
-    shade = rng.uniform(0.4, 1.3, n_disk)[:, None]
-    C.extend(((hot * (1.0 - t) + cool * t) * shade * 0.9).tolist())
-    R.extend((0.030 + 0.022 * t[:, 0]).tolist())
 
-    return Scene("Gargantua", P, V, M, S, C, R,
-                 n_src=1, gconst=G, dt=0.22, substeps=3, pw_rs=rs,
-                 bh=True, disk_in=r_in, disk_out=r_out, recycle=(1, 1 + n_disk),
-                 cam_dist=34.0, cam_pitch=0.075, cam_yaw=0.6,
-                 fov=42.0, gain=0.8, world_rs=rs, kill_drift=False)
+def make_star(cfg, n, rng, phi=0.5 * math.pi):
+    """Positions and velocities for one star: a self-consistent Plummer ball
+    (so it does not breathe or evaporate on its own) placed at apocentre of a
+    bound eccentric orbit, in the y = 0 plane.
+
+    Keeping the orbit in the equatorial plane matters: all the debris then
+    inherits that plane, so the disk it forms lands where the ray marcher's
+    own equatorial disk lives, and the two read as one structure."""
+    m_star, r_star = cfg["m_star"], cfg["r_star"]
+    r_apo, r_peri, gm = cfg["r_apo"], cfg["r_peri"], cfg["gm"]
+
+    p, v = plummer_sphere(n, m_star, r_star * 0.5, 1.0, rng, rcut=2.0)
+
+    a_orb = 0.5 * (r_apo + r_peri)
+    v_apo = math.sqrt(max(gm * (2.0 / r_apo - 1.0 / a_orb), 0.0))
+    # placed at azimuth phi and moving so its angular momentum points along -y,
+    # the same sense the ray-marched disk turns in, so the disk it eventually
+    # forms rotates the right way
+    sp, cp = math.sin(phi), math.cos(phi)
+    p = p + np.array([r_apo * sp, 0.0, r_apo * cp])
+    v = v + np.array([-v_apo * cp, 0.0, v_apo * sp])
+
+    m = np.full(n, m_star / n, dtype=np.float32)
+    s = np.full(n, cfg["soft"], dtype=np.float32)
+    return (np.ascontiguousarray(p, dtype=np.float32),
+            np.ascontiguousarray(v, dtype=np.float32), m, s)
 
 
 # ---------------------------------------------------------------------------
@@ -1324,7 +1460,9 @@ void main() {
                 vec3 emit = diskColor(temp) * emis * lanes * radial * boost * u_diskBright;
 
                 col += trans * emit;
-                trans *= exp(-2.4 * dens * radial);
+                // opacity has to fade out with brightness too, or a disk turned
+                // down to nothing still casts a dark band across the lensed sky
+                trans *= exp(-2.4 * dens * radial * clamp(u_diskBright, 0.0, 1.0));
             }
         }
     }
@@ -1621,6 +1759,12 @@ class Renderer:
         self.attr_vbo.write(scene.attrib.tobytes())
         self._upload_polylines(scene)
 
+    def update_attrib(self, scene, lo, hi):
+        """Re-upload just one slice of the colour/size buffer (used to re-tint
+        tidal debris as it falls deeper in) rather than the whole array."""
+        chunk = np.ascontiguousarray(scene.attrib[lo:hi], dtype=np.float32)
+        self.attr_vbo.write(chunk.tobytes(), offset=lo * 16)
+
     def _upload_polylines(self, scene):
         if self.orbit_vao is not None:
             self.orbit_vao.release()
@@ -1766,6 +1910,12 @@ class Sim:
         self.speed = 1.0
         self.paused = False
         self.rng = np.random.default_rng()
+        # tidal-disruption controls
+        self.self_gravity = True
+        self.viscosity = 0.004      # circularisation rate, 1 / time unit
+        self.inflow = 0.015         # fraction of that which removes L (drains the disk)
+        self.visc_radius = 22.0     # only inside here, where the stream piles up
+        self.circularising = False  # switched on once the star reaches pericentre
 
     def load(self, key):
         self.key = key
@@ -1784,11 +1934,35 @@ class Sim:
             k_update_satellites(s.n_dynamic, s.n_sat, 0.0)
         k_accel(s.n_dynamic, s.n_src, s.gconst, s.pw_rs)
         self.time = 0.0
+        self.circularising = False
         return s
+
+    def spawn_star(self, azimuth=0.5 * math.pi):
+        """Drop a fresh star onto the hole.  Slots are reused oldest-first once
+        they run out, so you can keep feeding it."""
+        s = self.scene
+        if not s.star_n:
+            return False
+        slot = s.star_spawned % s.star_slots
+        lo = 1 + slot * s.star_n
+        p, v, m, soft = make_star(s.star_cfg, s.star_n, self.rng, azimuth)
+        k_write_block(lo, s.star_n, p, v, m, soft)
+        s.star_spawned += 1
+        # grow the live range to cover every slot used so far; every dynamic
+        # particle here is also a gravity source, so the star holds itself
+        # together and its debris keeps pulling on itself
+        live = 1 + min(s.star_spawned, s.star_slots) * s.star_n
+        s.n_dynamic = max(s.n_dynamic, live)
+        s.n_base = s.n_dynamic + s.n_sat
+        s.n_src = s.n_dynamic if self.self_gravity else 1
+        k_accel(s.n_dynamic, s.n_src, s.gconst, s.pw_rs)
+        return True
 
     def step(self):
         s = self.scene
         dt = s.dt * self.speed
+        if s.star_n:
+            s.n_src = s.n_dynamic if self.self_gravity else 1
         for _ in range(s.substeps):
             k_kick(s.n_dynamic, 0.5 * dt)
             k_drift(s.n_dynamic, dt)
@@ -1797,6 +1971,12 @@ class Sim:
             self.time += dt
         if s.n_sat > 0:
             k_update_satellites(s.n_dynamic, s.n_sat, self.time)
+        if s.star_n and s.n_dynamic > 1:
+            s.accreted += k_swallow(1, s.n_dynamic, s.pw_rs)
+            if self.viscosity > 0.0 and self.circularising:
+                frac = 1.0 - math.exp(-self.viscosity * dt * s.substeps)
+                k_circularise(1, s.n_dynamic, frac, self.inflow,
+                              self.visc_radius, s.pw_rs)
         if s.recycle is not None:
             lo, hi = s.recycle
             k_recycle(lo, hi, s.gconst * s.mass[0], s.pw_rs,
@@ -1855,13 +2035,91 @@ class App:
         self.show_orbits = False
         self.show_heliosphere = False
         self.mission_on = {}   # mission name -> bool, populated fresh per scene
+        self.auto_disk = True  # let the ray-marched disk grow in from the debris
+        self.disk_peak = 2.1   # brightness the emergent disk builds up to
+        self.debris_inner = 0.0
+        self.debris_outer = 0.0
+        self.debris_frac = 0.0
 
     def load(self, key):
         self.scene = self.sim.load(key)
         self.renderer.upload_scene(self.scene)
         self.cam.adopt(self.scene)
         self.mission_on = {pl["name"]: False for pl in self.scene.polylines if pl["kind"] == "mission"}
+        self.debris_inner = self.debris_outer = self.debris_frac = 0.0
+        if self.scene.star_n:
+            # a bare hole: nothing to light up until a star has been torn apart
+            self.renderer.disk_bright = 0.0
+            self.scene.disk_in, self.scene.disk_out = 3.0, 26.0
         return self.scene
+
+    def update_tde(self, positions):
+        """Per-frame tidal-disruption bookkeeping: watch the debris, start
+        circularisation once the star has actually reached pericentre, fade the
+        ray-marched disk in as material piles up, and re-tint the debris by how
+        deep in the potential it sits."""
+        s, sim, r = self.scene, self.sim, self.renderer
+        if not s.star_n or s.star_spawned == 0 or s.n_dynamic <= 1:
+            return
+        deb = positions[1:s.n_dynamic]
+        rad = np.linalg.norm(deb, axis=1)
+        alive = rad < 1.0e3
+        n_alive = int(alive.sum())
+        if n_alive == 0:
+            self.debris_frac = 0.0
+            return
+
+        r_alive = rad[alive]
+        if not sim.circularising and r_alive.min() < 1.35 * s.star_cfg["r_peri"]:
+            sim.circularising = True     # pericentre reached: the stream is forming
+
+        # "Disk-like" means on a near-circular orbit, not merely nearby: an
+        # intact star coasting through apocentre has little radial motion too,
+        # and must not be mistaken for a disk.  Comparing its angular momentum
+        # against the circular value at the same radius separates the two.
+        vel_all = vel.to_numpy()[1:s.n_dynamic][alive]
+        p_alive = deb[alive]
+        rhat = p_alive / r_alive[:, None]
+        v_r = np.abs(np.sum(vel_all * rhat, axis=1))
+        v_c = np.sqrt(0.5 * r_alive) / np.maximum(r_alive - s.pw_rs, 1e-3)
+        l_mag = np.linalg.norm(np.cross(p_alive, vel_all), axis=1)
+        kappa = l_mag / np.maximum(r_alive * v_c, 1e-9)
+        disky = (r_alive < 45.0) & (v_r < 0.30 * v_c) & (kappa > 0.75) & (kappa < 1.3)
+        cnt = int(disky.sum())
+        self.debris_frac = cnt / float(n_alive)
+
+        tgt_bright, tgt_in, tgt_out = 0.0, s.disk_in, s.disk_out
+        if cnt > 60:
+            rr = r_alive[disky]
+            self.debris_inner = float(np.percentile(rr, 8))
+            self.debris_outer = float(np.percentile(rr, 90))
+            tgt_in = min(max(self.debris_inner, 2.2), 18.0)
+            tgt_out = min(max(self.debris_outer, tgt_in + 3.0), 60.0)
+            tgt_bright = self.disk_peak * min(1.0, self.debris_frac / 0.35)
+
+        if self.auto_disk:
+            # ease toward the target so the disk grows in smoothly instead of
+            # snapping around as debris sloshes through pericentre
+            k = 0.02
+            r.disk_bright += (tgt_bright - r.disk_bright) * k
+            s.disk_in += (tgt_in - s.disk_in) * k
+            s.disk_out += (tgt_out - s.disk_out) * k
+
+        # re-tint by depth in the potential: a star still on its way in stays
+        # stellar warm-white, debris shock-heats and brightens as it spirals in
+        t = np.clip((rad - 3.0) / 27.0, 0.0, 1.0)[:, None]
+        hot = np.array([1.00, 0.93, 0.88])[None, :]
+        cool = np.array([1.00, 0.80, 0.58])[None, :]
+        boost = (0.85 + 1.10 * (1.0 - t) ** 2)
+        s.attrib[1:s.n_dynamic, 0:3] = (hot * (1.0 - t) + cool * t) * boost
+        r.update_attrib(s, 1, s.n_dynamic)
+
+    def spawn_star(self):
+        """Drop the star on the far side of the hole from the camera, nudged off
+        the shadow.  Spawned at a fixed azimuth it usually lands outside a
+        42-degree field of view entirely, so you press the key and see nothing;
+        from back there it is centred in frame and falls in past the hole."""
+        return self.sim.spawn_star(self.cam.yaw + math.pi + 0.44)
 
     def visible_lines(self):
         """The set draw() checks each polyline against: the literal string
@@ -2050,9 +2308,67 @@ def draw_gui(app):
     imgui.pop_item_width()
     imgui.end()
 
+    # --- tidal disruption ----------------------------------------------------
+    imgui.set_next_window_pos(imgui.ImVec2(360, 12), imgui.Cond_.first_use_ever)
+    imgui.set_next_window_size(imgui.ImVec2(336, 400), imgui.Cond_.first_use_ever)
+    imgui.begin("Tidal Disruption")
+    sim = app.sim
+    if not scene.star_n:
+        imgui.text_colored(imgui.ImVec4(1.0, 0.75, 0.3, 1.0),
+                           "inactive: scene 3 has the black hole")
+    imgui.begin_disabled(not scene.star_n)
+    imgui.push_item_width(-118)
+    if imgui.button("Spawn star  (X)", imgui.ImVec2(-1, 0)):
+        app.spawn_star()
+    cfg = scene.star_cfg or {"m_star": 0.0, "r_star": 0.0, "r_peri": 0.0, "r_apo": 0.0}
+    changed, val = imgui.slider_float("star mass", cfg["m_star"] * 1e4, 0.2, 5.0, "%.2f e-4")
+    if changed:
+        cfg["m_star"] = val * 1e-4
+    changed, val = imgui.slider_float("star radius", cfg["r_star"], 0.3, 2.0, "%.2f r_s")
+    if changed:
+        cfg["r_star"] = val
+    changed, val = imgui.slider_float("pericentre", cfg["r_peri"], 3.5, 30.0, "%.1f r_s")
+    if changed:
+        cfg["r_peri"] = min(val, cfg["r_apo"] - 5.0)
+    changed, val = imgui.slider_float("drop from", cfg["r_apo"], 15.0, 120.0, "%.0f r_s")
+    if changed:
+        cfg["r_apo"] = max(val, cfg["r_peri"] + 5.0)
+
+    if cfg["m_star"] > 0.0:
+        # r_t = r_h (M_bh / M_star)^(1/3), with r_h = 1.3 a and a = r_star / 2
+        r_t = 0.65 * cfg["r_star"] * (0.5 / cfg["m_star"]) ** (1.0 / 3.0)
+        beta = r_t / max(cfg["r_peri"], 1e-6)
+        verdict = "full disruption" if beta >= 1.0 else "survives the pass"
+        col = imgui.ImVec4(0.5, 1.0, 0.6, 1.0) if beta >= 1.0 else imgui.ImVec4(1.0, 0.8, 0.4, 1.0)
+        imgui.text(f"tidal radius {r_t:6.1f} r_s")
+        imgui.text_colored(col, f"beta = r_t/r_p = {beta:4.2f}  {verdict}")
+
+    imgui.separator_text("debris")
+    changed, val = imgui.checkbox("self-gravity", sim.self_gravity)
+    if changed:
+        sim.self_gravity = val
+    changed, val = imgui.checkbox("disk grows from debris", app.auto_disk)
+    if changed:
+        app.auto_disk = val
+    changed, val = imgui.slider_float("viscosity", sim.viscosity, 0.0, 0.03, "%.4f")
+    if changed:
+        sim.viscosity = val
+    changed, val = imgui.slider_float("accretion rate", sim.inflow, 0.0, 0.10, "%.3f")
+    if changed:
+        sim.inflow = val
+    imgui.text(f"stars dropped  {scene.star_spawned:6d}")
+    imgui.text(f"accreted       {scene.accreted:6d}")
+    imgui.text(f"bound fraction {app.debris_frac * 100.0:5.1f} %")
+    if app.debris_outer > 0.0:
+        imgui.text(f"debris  {app.debris_inner:5.1f} - {app.debris_outer:5.1f} r_s")
+    imgui.text("circularising" if sim.circularising else "waiting for pericentre")
+    imgui.pop_item_width()
+    imgui.end_disabled()
+    imgui.end()
+
     # --- solar system overlays ----------------------------------------------
-    imgui.set_next_window_pos(imgui.ImVec2(360, 522), imgui.Cond_.first_use_ever)
-    imgui.set_next_window_size(imgui.ImVec2(320, 300), imgui.Cond_.first_use_ever)
+    imgui.set_next_window_pos(imgui.ImVec2(360, 424), imgui.Cond_.first_use_ever)
+    imgui.set_next_window_size(imgui.ImVec2(336, 330), imgui.Cond_.first_use_ever)
     imgui.begin("Solar System")
     is_ss = scene.name == "Solar System"
     if not is_ss:
@@ -2216,6 +2532,8 @@ def main():
                     app.show_labels = not app.show_labels
                 elif ev.key == pygame.K_o:
                     app.show_orbits = not app.show_orbits
+                elif ev.key == pygame.K_x:
+                    app.spawn_star()
                 elif ev.key in (pygame.K_RIGHTBRACKET, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     app.sim.speed = min(app.sim.speed * 1.4, 16.0)
                 elif ev.key in (pygame.K_LEFTBRACKET, pygame.K_MINUS, pygame.K_KP_MINUS):
@@ -2276,6 +2594,7 @@ def main():
         if not app.sim.paused:
             app.sim.step()
         positions = pos.to_numpy()[:scene.n]
+        app.update_tde(positions)
 
         impl.process_inputs()
         imgui.new_frame()
