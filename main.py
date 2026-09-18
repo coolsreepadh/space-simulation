@@ -29,11 +29,24 @@ Scenes (number keys, or the Scenes panel)
                               their real Keplerian orbits (true eccentricity
                               and inclination, not flattened circles), major
                               moons, Saturn's rings, asteroid/Kuiper belts,
-                              and real space-mission trajectories.  The Oort
-                              cloud and the heliosphere are switchable in the
-                              "Solar System" panel: both are far enough out
-                              that seeing either means leaving the planets as
-                              a knot in the middle
+                              and real space-mission trajectories built as
+                              patched conics -- true flyby distances, orbit
+                              shapes and escape asymptotes.  The date box in
+                              the "Solar System" panel (or --date) places every
+                              body where it REALLY is on any day you name,
+                              today included, from its published mean
+                              longitude; the panel then shows the date ticking
+                              forward as the run goes on, because a scene
+                              measured in AU and solar masses has a year in it.
+                              "Now" (or --date today) goes further and locks
+                              the clock to the wall clock, one second per
+                              second, so it stays on the present and reads out
+                              the real date and time instead of crossing a
+                              fortnight of Solar System every second
+                              The Oort cloud and the heliosphere are switchable
+                              in the same panel: both are far enough out that
+                              seeing either means leaving the planets as a knot
+                              in the middle
     2  Galaxy Merger          two live spiral galaxies, bulge + halo + disk,
                               on a grazing prograde encounter -- bridge,
                               tidal tails, merger
@@ -76,6 +89,14 @@ def parse_args(argv=None):
                     help="scene to start in (default: 2, galaxy merger)")
     ap.add_argument("--fullscreen", action="store_true",
                     help="start fullscreen instead of in a resizable window")
+    ap.add_argument("--date", default="",
+                    help="place the Solar System's planets where they really are "
+                         "on this date: YYYY-MM-DD, or 'today'.  Omitted, they are "
+                         "scattered to random true anomalies as before")
+    ap.add_argument("--real-time", dest="real_time", action="store_true",
+                    help="run the clock at wall-clock speed, one second per "
+                         "second, instead of racing ahead.  Implied by "
+                         "--date today")
     ap.add_argument("--width", type=int, default=0)
     ap.add_argument("--height", type=int, default=0)
     ap.add_argument("--scale", type=float, default=0.85,
@@ -233,6 +254,16 @@ SIM_MASS_TO_SOLAR = BH_SOLAR_MASSES / 0.5
 
 GRAVEYARD = 6.0e4      # where accreted particles are parked: far enough that
                        # the point sprite's distance falloff makes them vanish
+
+# The spawned star is a Plummer ball, and this is its scale radius as a
+# fraction of the "star radius" the panel asks for (which is the truncation
+# radius, rcut * a).  Named rather than written twice, because the tidal radius
+# the panel reports is derived from it: a Plummer sphere has no edge, so the
+# radius that belongs in r_t = r (M_bh/M_star)^(1/3) is its half-mass radius,
+# 1.305 a.  Those two numbers disagreeing is how the panel came to report a
+# tidal radius 19% larger than the star it was actually describing.
+STAR_PLUMMER_A = 0.42
+STAR_HALF_MASS = 1.305 * STAR_PLUMMER_A
 
 _swallowed = ti.field(ti.i32, shape=1)
 _red = ti.Vector.field(4, ti.f32, shape=1)   # (m*vx, m*vy, m*vz, m) accumulator
@@ -615,8 +646,13 @@ class Scene:
                  cam_dist=100.0, cam_yaw=0.0, cam_pitch=0.35, cam_target=(0, 0, 0),
                  fov=55.0, gain=1.0, world_rs=1.0, kill_drift=True,
                  n_dynamic=None, satellites=None, labels=None, polylines=None,
-                 gas="", gas_half=(GAS_RX, GAS_RY), gas_lo=1, extras=()):
+                 gas="", gas_half=(GAS_RX, GAS_RY), gas_lo=1, extras=(),
+                 epoch_jd=None):
         self.name = name
+        # Julian day the scene was built for, or None if its bodies were placed
+        # at arbitrary phases.  Set, it makes sim time a real elapsed time and
+        # lets the panel put a calendar date on the frame (see YEAR_UNITS).
+        self.epoch_jd = float(epoch_jd) if epoch_jd is not None else None
         self.pos = np.ascontiguousarray(pos, dtype=np.float32)
         self.vel = np.ascontiguousarray(vel, dtype=np.float32)
         self.mass = np.ascontiguousarray(mass, dtype=np.float32)
@@ -832,6 +868,36 @@ def _kepler_rot_coeffs(i_deg, node_deg, argp_deg):
     return r11, r12, r21, r22, r31, r32
 
 
+def ecl_to_sim(v):
+    """Ecliptic (X, Y, Z-toward-north) -> the scene's (x, y-up, z).  Every
+    piece of real orbital geometry in this file comes in ecliptic coordinates
+    and goes through here, so the convention is written down once instead of
+    being re-derived, differently, at each site that needs it.
+
+    This alone is a mirror image; the reflection is undone for the whole scene
+    at once at the end of preset_solar_system.  See the note there."""
+    v = np.asarray(v, dtype=np.float64)
+    return np.array([v[0], v[2], v[1]])
+
+
+def orbit_plane_axes(i_deg, node_deg):
+    """The two unit vectors that span an orbit plane, in sim axes: the first
+    points at the ascending node, the second 90 degrees along the direction of
+    motion.  A body at argument of latitude u then sits at
+
+        cos(u) * node_axis + sin(u) * ahead_axis
+
+    and u simply advancing is a body going round the right way -- including
+    backwards, with no flag to say so, because an inclination past 90 degrees
+    turns the second axis around on its own.  That is how Triton and Charon
+    get their real retrograde orbits here: from their real inclinations."""
+    i, om = math.radians(i_deg), math.radians(node_deg)
+    node = np.array([math.cos(om), math.sin(om), 0.0])
+    ahead = np.array([-math.cos(i) * math.sin(om),
+                      math.cos(i) * math.cos(om), math.sin(i)])
+    return ecl_to_sim(node), ecl_to_sim(ahead)
+
+
 def kepler_state(a, e, i_deg, node_deg, argp_deg, nu, gm=1.0):
     """Classical orbital elements plus a true anomaly -> Cartesian (pos, vel),
     via the standard perifocal-to-reference-frame rotation.  a is in sim
@@ -858,7 +924,7 @@ def kepler_state(a, e, i_deg, node_deg, argp_deg, nu, gm=1.0):
     Za = r31 * x_pf + r32 * y_pf
     Vxa, Vya = r11 * vx_pf + r12 * vy_pf, r21 * vx_pf + r22 * vy_pf
     Vza = r31 * vx_pf + r32 * vy_pf
-    return np.array([Xa, Za, Ya]), np.array([Vxa, Vza, Vya])
+    return ecl_to_sim([Xa, Ya, Za]), ecl_to_sim([Vxa, Vya, Vza])
 
 
 def kepler_orbit_outline(a, e, i_deg, node_deg, argp_deg, n=192):
@@ -871,95 +937,665 @@ def kepler_orbit_outline(a, e, i_deg, node_deg, argp_deg, n=192):
     r11, r12, r21, r22, r31, r32 = _kepler_rot_coeffs(i_deg, node_deg, argp_deg)
     Xa, Ya = r11 * x_pf + r12 * y_pf, r21 * x_pf + r22 * y_pf
     Za = r31 * x_pf + r32 * y_pf
-    return np.stack([Xa, Za, Ya], axis=1).astype(np.float32)
+    return np.stack([Xa, Za, Ya], axis=1).astype(np.float32)   # ecl_to_sim, vectorised
 
 
 # ---------------------------------------------------------------------------
 # 1) Solar System disk
 # ---------------------------------------------------------------------------
 
-def catmull_rom(points, samples_per_seg=24):
-    """Smooth C1 path through 3D control points (Nx3) -- duplicates the end
-    points so the curve starts and ends exactly on the first/last waypoint.
-    Used for the illustrative spacecraft trajectories below: real mission
-    paths are patched-conic, gravity-assisted trajectories that would need a
-    full ephemeris and launch-date epoch to reproduce exactly, which this
-    sim's timeless N-body model has no notion of.  What IS kept faithful is
-    the real sequence and heliocentric distance of every flyby and encounter;
-    only the smooth curve connecting them is stylised."""
-    pts = np.asarray(points, dtype=np.float64)
-    pts = np.vstack([pts[0], pts, pts[-1]])
-    out = []
-    for i in range(1, len(pts) - 2):
-        p0, p1, p2, p3 = pts[i - 1], pts[i], pts[i + 1], pts[i + 2]
-        for s in range(samples_per_seg):
-            t = s / samples_per_seg
-            t2, t3 = t * t, t * t * t
-            out.append(0.5 * ((2 * p1) + (-p0 + p2) * t
-                              + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
-                              + (-p0 + 3 * p1 - 3 * p2 + p3) * t3))
-    out.append(pts[-2])
-    return np.array(out, dtype=np.float32)
+AU_UNITS = 10.0           # scene units per astronomical unit (see preset_solar_system)
+R_SUN_AU = 0.00465047     # one solar radius in AU -- Parker's perihelia are published in these
 
 
-def _helio_wp(r_au, theta_deg, incl_deg=0.0):
-    """A mission waypoint: r_au is the TRUE heliocentric distance in AU (so
-    real published mission facts, e.g. "Voyager 1 crossed the heliopause at
-    121.6 AU", plug straight in), theta_deg the azimuth, incl_deg the angle
-    above (+) or below (-) the ecliptic."""
-    r = r_au * 10.0
-    th, inc = math.radians(theta_deg), math.radians(incl_deg)
-    xz = r * math.cos(inc)
-    return [xz * math.cos(th), r * math.sin(inc), xz * math.sin(th)]
+# --- putting the planets where they really are on a given date --------------
+#
+# Every body in the table below carries, besides its orbit's shape and
+# orientation, its MEAN LONGITUDE: the angle it would be at if it swept the
+# orbit at a constant rate, published as a value at J2000 plus a rate per
+# century.  That one extra number per body is the whole difference between a
+# solar system whose planets are scattered at random and one that shows where
+# they actually were -- or will be -- on a particular day:
+#
+#     date -> Julian day -> centuries since J2000 -> mean longitude L
+#          -> mean anomaly M = L - peri -> Kepler's equation -> true anomaly
+#
+# and a true anomaly is exactly what kepler_state already takes, so a dated
+# scene is the same scene with one number per planet solved for instead of
+# drawn from the RNG.  Nothing about the physics changes: the bodies are still
+# handed to the same integrator and still move under their mutual gravity from
+# that starting configuration onward.
+#
+# Only the mean longitude is advanced with the date.  The other five elements
+# drift too, but at rates (Saturn's perihelion, the fastest, moves 0.42 deg a
+# century) that are invisible here against a Saturn drawn 1.5 units wide, while
+# the mean longitude runs through thousands of degrees over the same span and
+# is the entire reason one date looks different from another.
+
+J2000_JD = 2451545.0        # 2000 Jan 1.5 TT -- the epoch the elements are referred to
+DAYS_PER_CENTURY = 36525.0   # a Julian century, the unit the element rates use
+
+# Days in one revolution of the scene's own Earth.  With G = 1, M_sun = 1 and
+# a = AU_UNITS, Kepler's third law makes that the SIDEREAL year, 365.2564 d --
+# not the Julian year of 365.25 that the element rates above are quoted in.
+# The two differ by 1.7e-5, which sounds like nothing and is not: it is a
+# systematic rate error in the clock rather than a wobble, so it accumulates
+# to two thirds of a day per century of run time, and the clock's whole
+# purpose is to be the date rather than approximately the date.
+SIM_YEAR_DAYS = 365.256363
+
+# One Julian year in sim time units.  This is not a fitted constant: the
+# preset runs with G = 1, M_sun = 1 and Earth at a = AU_UNITS, so Kepler's
+# third law fixes a year as one revolution at that radius and leaves nothing to
+# choose.  It is what lets a dated run show a real date ticking forward rather
+# than a bare step count.
+YEAR_UNITS = 2.0 * math.pi * AU_UNITS ** 1.5
+
+
+def julian_day(year, month, day):
+    """Proleptic-Gregorian calendar date -> Julian day at 00:00 UT, by the
+    usual integer-arithmetic form.  day may carry a fraction."""
+    y, m = int(year), int(month)
+    if m <= 2:
+        y, m = y - 1, m + 12
+    a = y // 100
+    b = 2 - a + a // 4
+    return (math.floor(365.25 * (y + 4716)) + math.floor(30.6001 * (m + 1))
+            + float(day) + b - 1524.5)
+
+
+def calendar_date(jd):
+    """Julian day -> (year, month, day), the exact inverse of julian_day and
+    proleptic Gregorian for the same reason: a run started in 1500 should read
+    back the date it was given, not the Julian-calendar date that fell on the
+    same day."""
+    z = math.floor(jd + 0.5)
+    f = (jd + 0.5) - z
+    alpha = math.floor((z - 1867216.25) / 36524.25)
+    a = z + 1 + alpha - math.floor(alpha / 4.0)
+    b = a + 1524
+    c = math.floor((b - 122.1) / 365.25)
+    d = math.floor(365.25 * c)
+    e = math.floor((b - d) / 30.6001)
+    day = b - d - math.floor(30.6001 * e) + f
+    month = int(e - 1 if e < 14 else e - 13)
+    year = int(c - 4716 if month > 2 else c - 4715)
+    return year, month, int(math.floor(day))
+
+
+def clock_time(jd):
+    """Time of day at a Julian day, as (hour, minute, second) UTC.  A Julian
+    day starts at noon, which is what the half-day offset is undoing."""
+    secs = int(round(((jd + 0.5) % 1.0) * 86400.0)) % 86400
+    return secs // 3600, (secs // 60) % 60, secs % 60
+
+
+def today_jd():
+    """This instant, as a Julian day -- time of day included, so a scene built
+    from it starts at the actual moment and not at midnight."""
+    tm = time.gmtime()
+    frac = (tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec) / 86400.0
+    return julian_day(tm.tm_year, tm.tm_mon, tm.tm_mday + frac)
+
+
+def parse_date(text):
+    """'YYYY-MM-DD', or 'today'/'now', -> Julian day.  Raises ValueError on
+    anything else, so a mistyped --date is a message rather than a scene
+    quietly built for the wrong day."""
+    s = str(text).strip().lower()
+    if s in ("today", "now"):
+        return today_jd()
+    parts = s.replace("/", "-").split("-")
+    if len(parts) != 3:
+        raise ValueError(f"cannot read {text!r} as a date (want YYYY-MM-DD or 'today')")
+    y, m, d = (int(p) for p in parts)
+    if not 1 <= m <= 12 or not 1 <= d <= 31:
+        raise ValueError(f"{text!r} is not a real date")
+    return julian_day(y, m, d)
+
+
+# --date, resolved once here rather than when the scene is built, so a
+# mistyped one is a line of text before anything starts instead of a traceback
+# out of a window that has already opened.
+try:
+    ARGS_EPOCH_JD = parse_date(ARGS.date) if ARGS.date else None
+except ValueError as _exc:
+    raise SystemExit(f"--date: {_exc}")
+
+# Asking for today is asking to watch the Solar System as it is, so the clock
+# comes up locked to the wall clock rather than sprinting; a specific date has
+# no such implication and runs at the usual speed unless --real-time says not to.
+ARGS_EPOCH_IS_NOW = ARGS.date.strip().lower() in ("today", "now")
+ARGS_REAL_TIME = bool(ARGS.real_time) or ARGS_EPOCH_IS_NOW
+
+# The most wall-clock time one frame will ever integrate.  Frames stop arriving
+# while a window is minimised or a laptop is asleep, and without a ceiling the
+# first frame back would try to swallow the whole absence in a single step --
+# a step big enough to be wrong, and on a long enough sleep to fling the
+# planets off.  Past this the missed time is simply dropped: the clock falls
+# behind, visibly, and the Now button puts it back.
+REALTIME_MAX_CATCHUP = 3600.0
+
+
+def solve_kepler(m_deg, e):
+    """Mean anomaly (degrees) -> eccentric anomaly (radians), by Newton's
+    method on Kepler's equation M = E - e sin E.  The transcendental step no
+    closed form gets past, and the one place a dated scene costs anything at
+    all -- a dozen iterations, once per planet, at load."""
+    m = math.radians((m_deg + 180.0) % 360.0 - 180.0)
+    ea = m + e * math.sin(m)
+    for _ in range(64):
+        step = (ea - e * math.sin(ea) - m) / (1.0 - e * math.cos(ea))
+        ea -= step
+        if abs(step) < 1e-13:
+            break
+    return ea
+
+
+# Saturn's equatorial plane in ecliptic terms, from the IAU pole (right
+# ascension 40.589 deg, declination 83.537 deg) rotated out of the equatorial
+# frame: the pole tips 28.05 deg from the ecliptic pole and the plane crosses
+# the ecliptic at longitude 169.53.  The rings and every regular moon of
+# Saturn lie in it, and Horizons agrees -- Enceladus, Rhea and Titan come back
+# with inclinations of 28.05, 28.24 and 27.72 about nodes of 169.5, 169.0 and
+# 169.2, which is those moons' own degree of tilt out of exactly this plane.
+SATURN_EQUATOR_INCL = 28.049
+SATURN_EQUATOR_NODE = 169.53
+
+# What this model of the moons is worth: the angle between the direction each
+# moon is placed in and the direction JPL's ephemeris puts it in, worst case
+# over three dates spread across 1997-2044.
+#
+#   Charon    0.02      Enceladus 1.33      Triton  3.25
+#   Titania   0.11      Europa    1.70      Phobos  4.14
+#   Ganymede  0.29      Deimos    2.94      Titan   5.20
+#   Io        0.46      Rhea      0.43      Moon    9.59
+#   Callisto  0.85
+#
+# Under two degrees is most of them, and two degrees is far less than the
+# width of the planet they are drawn beside.  The three that are worse are
+# worse for reasons a circle cannot fix: Titan's orbit is eccentric enough
+# (0.029) that a circle is off by twice that in angle on its own; Triton's
+# steeply inclined plane precesses; and the Moon carries perturbations the Sun
+# puts into it -- evection at 1.27 degrees, the variation at 0.66 -- that no
+# fixed circle has anywhere to put.  Ten degrees of a 27-day orbit is about
+# three quarters of a day: the Moon is on the right side of the Earth, not at
+# the right hour.
+
+
+def true_anomaly_at(jd, e, peri_deg, l0_deg, dl_cy):
+    """True anomaly (radians) on Julian day jd of a body whose mean longitude
+    is l0_deg at J2000 and advances dl_cy degrees per Julian century."""
+    t = (jd - J2000_JD) / DAYS_PER_CENTURY
+    ea = solve_kepler(l0_deg + dl_cy * t - peri_deg, e)
+    return 2.0 * math.atan2(math.sqrt(1.0 + e) * math.sin(0.5 * ea),
+                            math.sqrt(1.0 - e) * math.cos(0.5 * ea))
+
+
+# name, semi-major axis (AU), eccentricity, inclination, longitude of the
+# ascending node, LONGITUDE OF PERIHELION (all degrees), mean longitude at
+# J2000 and its rate in degrees per Julian century, mass (solar masses),
+# draw radius, colour, and moons as (name, orbit radius in multiples of the
+# planet's own drawn radius, drawn size, colour, sidereal period in days,
+# inclination to the ECLIPTIC, longitude of the ascending node, and
+# argument of latitude at J2000 -- the angle round the orbit from that
+# node, which is what puts a moon on the correct side of its planet).
+#
+# Only the orbit radius is a drawn quantity; the other four are measured.
+# Inclination and node are the osculating ecliptic values at J2000 from
+# JPL Horizons, which for a regular satellite is its planet's equator --
+# hence Uranus's moon at 97.8 degrees and Neptune's at 130.3, tipped and
+# retrograde exactly as far as the real ones are.  Period and argument of
+# latitude were then fitted to Horizons positions sampled from 1960 to
+# 2050, rather than taken from published period tables, because the angle
+# here is measured from a FIXED node while a published sidereal period is
+# not always: over ninety years the difference is whole revolutions.  The
+# fit residuals are what this model is worth, and they are listed against
+# each moon beside SATURN_EQUATOR_INCL above.
+#
+# The eight planets and Pluto are Standish's table for the approximate
+# positions of the major planets, fitted over 1800-2050 and good to well
+# under a thousandth of an AU for the inner planets and a few hundredths
+# for the outer ones across that span -- far finer than a planet here is
+# drawn.  The four remaining dwarf planets are their current osculating
+# elements from JPL's small-body database, converted to the same form.
+#
+# Note "longitude of perihelion", not "argument of perihelion": the two
+# differ by the node, and the argument kepler_state wants is recovered as
+# peri - node below.  This column USED to be fed straight in as if it were
+# the argument, which rotated each planet's ellipse within its own plane by
+# its node -- harmless while the bodies sat at random anomalies, and wrong
+# the moment a real date is asked for.
+SOLAR_BODIES = [
+    ("Mercury", 0.38709927, 0.20563593, 7.00497902, 48.33076593, 77.45779628,
+     252.25032350, 149472.67411175,
+     1.66e-7, 0.45, (1.00, 0.86, 0.66), []),
+    ("Venus", 0.72333566, 0.00677672, 3.39467605, 76.67984255, 131.60246718,
+     181.97909950, 58517.81538729,
+     2.45e-6, 0.70, (1.00, 0.82, 0.50), []),
+    # Earth's row is really the Earth-Moon barycentre's, which is what the
+    # published table tracks and what the Sun actually pulls on.
+    ("Earth", 1.00000261, 0.01671123, -0.00001531, 0.0, 102.93768193,
+     100.46457166, 35999.37244981,
+     3.00e-6, 0.72, (0.45, 0.68, 1.00), [
+        ("Moon", 1.9, 0.11, (0.80, 0.80, 0.78),
+         27.3221263, 5.2403, 123.9581, 95.339),
+    ]),
+    ("Mars", 1.52371034, 0.09339410, 1.84969142, 49.55953891, -23.94362959,
+     -4.55343205, 19140.30268499,
+     3.23e-7, 0.58, (1.00, 0.48, 0.32), [
+        ("Phobos", 1.5, 0.045, (0.65, 0.55, 0.48),
+         0.3189101, 26.0567, 84.8151, 172.502),
+        ("Deimos", 2.1, 0.040, (0.60, 0.58, 0.55),
+         1.2624408, 27.5694, 83.6693, 217.091),
+    ]),
+    ("Ceres", 2.76555260, 0.07969230, 10.58802780, 80.24862682, 153.54284135,
+     158.74556430, 7827.47006000,
+     4.72e-10, 0.14, (0.62, 0.60, 0.58), []),
+    ("Jupiter", 5.20288700, 0.04838624, 1.30439695, 100.47390909, 14.72847983,
+     34.39644051, 3034.74612775,
+     9.55e-4, 1.70, (0.95, 0.80, 0.62), [
+        ("Io", 2.3, 0.15, (0.90, 0.78, 0.45),
+         1.7691377, 2.2126, 336.8524, 41.167),
+        ("Europa", 3.0, 0.13, (0.85, 0.80, 0.72),
+         3.5511813, 1.7910, 332.6287, 239.648),
+        ("Ganymede", 3.9, 0.17, (0.72, 0.66, 0.58),
+         7.1545539, 2.2141, 343.1728, 236.862),
+        ("Callisto", 5.0, 0.16, (0.48, 0.44, 0.42),
+         16.6890147, 2.0169, 337.9426, 100.948),
+    ]),
+    ("Saturn", 9.53667594, 0.05386179, 2.48599187, 113.66242448, 92.59887831,
+     49.95424423, 1222.49362201,
+     2.86e-4, 1.50, (0.98, 0.88, 0.66), [
+        ("Enceladus", 2.6, 0.075, (0.92, 0.94, 0.96),
+         1.3702183, 28.0520, 169.5066, 142.301),
+        ("Rhea", 3.4, 0.095, (0.80, 0.78, 0.72),
+         4.5175025, 28.2414, 168.9842, 12.676),
+        ("Titan", 4.6, 0.19, (0.90, 0.72, 0.42),
+         15.9455490, 27.7183, 169.2392, 327.251),
+    ]),
+    ("Uranus", 19.18916464, 0.04725744, 0.77263783, 74.01692503, 170.95427630,
+     313.23810451, 428.48202785,
+     4.37e-5, 1.05, (0.62, 0.92, 0.96), [
+        ("Titania", 2.6, 0.09, (0.72, 0.78, 0.85),
+         8.7058689, 97.8184, 167.6178, 276.500),
+    ]),
+    ("Neptune", 30.06992276, 0.00859048, 1.77004347, 131.78422574, 44.96476227,
+     -55.12002969, 218.45945325,
+     5.15e-5, 1.02, (0.42, 0.60, 1.00), [
+        ("Triton", 2.8, 0.10, (0.62, 0.72, 0.95),
+         5.8768440, 130.2614, 215.8591, 74.690),
+    ]),
+    ("Pluto", 39.48211675, 0.24882730, 17.14001206, 110.30393684, 224.06891629,
+     238.92903833, 145.20780515,
+     6.55e-9, 0.26, (0.80, 0.68, 0.58), [
+        ("Charon", 2.2, 0.13, (0.72, 0.70, 0.68),
+         6.3872221, 112.8908, 227.3917, 321.251),
+    ]),
+    ("Haumea", 43.06029000, 0.19444300, 28.20847400, 121.78605600, 2.47660300,
+     192.00769000, 127.40277000,
+     2.02e-9, 0.19, (0.88, 0.90, 0.92), []),
+    ("Makemake", 45.57093300, 0.15888900, 29.02785600, 79.29483400, 16.38710700,
+     155.39033000, 117.02063000,
+     1.56e-9, 0.18, (0.72, 0.48, 0.38), []),
+    ("Eris", 67.93394700, 0.43823900, 43.92582800, 36.00477000, 186.79969400,
+     21.57806000, 64.29305000,
+     8.35e-9, 0.25, (0.85, 0.85, 0.88), []),
+]
+
+
+def body_longitude(name, jd):
+    """Heliocentric ecliptic longitude of a named body on a Julian day, in
+    degrees.  Pulled straight off the same table and the same solver that
+    place the body in the scene, so a mission path aimed with this cannot
+    drift away from the planet it is aimed at."""
+    for row in SOLAR_BODIES:
+        if row[0] != name:
+            continue
+        _, a_au, e, i_deg, node_deg, peri_deg, l0_deg, dl_cy = row[:8]
+        nu = true_anomaly_at(jd, e, peri_deg, l0_deg, dl_cy)
+        p = kepler_state(1.0, e, i_deg, node_deg, peri_deg - node_deg, nu)[0]
+        # kepler_state hands back scene axes, where before the preset's final
+        # mirror the azimuth in the x-z plane IS the ecliptic longitude
+        return math.degrees(math.atan2(p[2], p[0])) % 360.0
+    raise KeyError(name)
+
+
+def _rodrigues(v, axis, ang):
+    """Rotate vector v about a unit axis by ang radians."""
+    c, s = math.cos(ang), math.sin(ang)
+    return v * c + np.cross(axis, v) * s + axis * (np.dot(axis, v) * (1.0 - c))
+
+
+def _nu_at_r(q, e, r):
+    """True anomaly in 0..pi at which a conic of perihelion distance q and
+    eccentricity e sits at radius r -- the inverse of r = q(1+e)/(1+e cos nu).
+    Clamped, so asking an ellipse for a radius past its aphelion gives the
+    aphelion (nu = pi) rather than a domain error."""
+    if e < 1e-9:
+        return 0.0
+    return math.acos(max(-1.0, min(1.0, (q * (1.0 + e) / r - 1.0) / e)))
+
+
+class Cruise:
+    """A heliocentric trajectory assembled leg by leg out of TRUE conic arcs.
+
+    Between encounters a spacecraft is a two-body problem and nothing else: it
+    coasts along a conic section about the Sun, an ellipse if it is bound and a
+    hyperbola if it is not.  A gravity assist then changes its velocity over a
+    few days while leaving it essentially where it was, so the next conic
+    starts exactly where the previous one ended, with a different shape and, in
+    general, an orbit plane tilted about the Sun-to-spacecraft line.  Chaining
+    conics that way is how these trajectories are really designed, and building
+    the drawn paths the same way is what makes them come out the right SHAPE --
+    a smooth curve threaded through the published flyby distances cannot,
+    because it has no way to know that a probe whips through perihelion and
+    crawls through aphelion, that a bound orbit closes on itself instead of
+    drifting sideways, or that an escaping one straightens onto a fixed
+    asymptote instead of curving forever.
+
+    The chain carries a current position and a current orbit normal.  Each leg
+    optionally tilts the plane about the current radius vector -- the flyby
+    point lies on that axis, so it does not move, which is exactly the property
+    that lets the legs join with no seam and no fudging -- then sweeps a conic
+    through a span of true anomaly, anchored so the leg begins on the point the
+    last one ended at.
+
+    Heliocentric DISTANCES, orbit shapes, plane tilts and the order of
+    encounters are the real published ones, and aim_at then turns the finished
+    chain until its flybys sit on the planets they really were flybys of, on
+    the dates they really happened.  So the bend in Voyager 1's path is not
+    near Saturn's orbit, it is on Saturn -- where Saturn stood in November
+    1980.  Set the date to that November and the planet is waiting at the bend.
+
+    Which also means the paths do NOT follow the planets around.  A trajectory
+    is fixed in space, drawn where it was flown; the planets move, and meet it
+    only on the dates they met it.  Every other date shows them apart, which is
+    the truth about a spacecraft that went past forty years ago.
+    """
+
+    def __init__(self, r0_au, az_deg):
+        th = math.radians(az_deg)
+        self.p = np.array([math.cos(th), 0.0, math.sin(th)], dtype=np.float64) * r0_au
+        # scene axes are (x, up, z); this is the normal that makes the motion
+        # prograde -- the same sense the planets are placed going around in
+        self.h = np.array([0.0, -1.0, 0.0])
+        self.pts = [self.p.copy()]
+        # Index in pts of every joint between legs -- which is to say of every
+        # encounter, since a leg is exactly the coast between two of them.
+        # These are the points that have to land on a planet once the path is
+        # turned to face the right way; see align_to_encounters.
+        self.joints = [0]
+
+    def leg(self, q, e, nu_end_deg, nu_start_deg=None, tilt_deg=0.0, n=180):
+        """Sweep one conic arc: q perihelion distance in AU, e eccentricity,
+        the true anomalies in degrees, tilt_deg the gravity assist's rotation
+        of the orbit plane about the Sun-to-spacecraft line at the joint."""
+        r0 = float(np.linalg.norm(self.p))
+        if abs(tilt_deg) > 1e-9:
+            axis = self.p / r0
+            self.h = _rodrigues(self.h, axis, math.radians(tilt_deg))
+            self.h /= np.linalg.norm(self.h)
+        if nu_start_deg is None:
+            nu_start_deg = math.degrees(_nu_at_r(q, e, r0))
+        nu0, nu1 = math.radians(nu_start_deg), math.radians(nu_end_deg)
+        # perihelion direction: the current point wound back by its own true
+        # anomaly.  peri stays perpendicular to h because p is, so the full
+        # Rodrigues formula collapses to the two terms used below.
+        peri = _rodrigues(self.p / r0, self.h, -nu0)
+        side = np.cross(self.h, peri)
+        nu = np.linspace(nu0, nu1, max(int(n), 2))
+        r = q * (1.0 + e) / (1.0 + e * np.cos(nu))
+        pts = (peri[None, :] * np.cos(nu)[:, None]
+               + side[None, :] * np.sin(nu)[:, None]) * r[:, None]
+        self.pts.extend(pts[1:])
+        self.p = pts[-1].copy()
+        self.joints.append(len(self.pts) - 1)
+        return self
+
+    def coast_to(self, q, e, r_end_au, tilt_deg=0.0, n=180):
+        """The common case: coast outward along a conic from wherever the chain
+        is to the radius of the next encounter.  A leg that instead runs in
+        past an apsis has to name its own true anomalies, since the radius
+        alone no longer says where on the conic either end of it sits."""
+        r0 = float(np.linalg.norm(self.p))
+        return self.leg(q, e, math.degrees(_nu_at_r(q, e, r_end_au)),
+                        nu_start_deg=math.degrees(_nu_at_r(q, e, r0)),
+                        tilt_deg=tilt_deg, n=n)
+
+    def revolution(self, q, e, tilt_deg=0.0, n=260):
+        """One complete turn of a closed orbit, starting and ending on the
+        point the chain is at -- a bound spacecraft comes back to where it was,
+        which is the whole difference between an orbit and a trajectory."""
+        r0 = float(np.linalg.norm(self.p))
+        nu0 = math.degrees(_nu_at_r(q, e, r0))
+        return self.leg(q, e, nu0 + 360.0, nu_start_deg=nu0, tilt_deg=tilt_deg, n=n)
+
+    def aim_at(self, encounters):
+        """Turn the whole trajectory about the ecliptic pole so its flybys land
+        on the planets they really were flybys OF.
+
+        Everything up to here fixes a trajectory's SHAPE -- its distances, its
+        conic eccentricities, the angle each leg sweeps -- but leaves it facing
+        an arbitrary direction, because a conic built from distances has no
+        idea which way round the Sun it should be pointing.  Given the real
+        date of each encounter, the planet's real longitude on that date is a
+        lookup, and one rotation is then the only freedom left.
+
+        It is only one rotation for the whole path, and that is the honest
+        limit: where each flyby sits RELATIVE to the others is already decided
+        by the shape, so a mission whose legs sweep slightly the wrong angle
+        cannot have every flyby land at once, and the fit shares the error out
+        instead of hiding it in one place.  The share is weighted by how far
+        out each encounter is, since a degree of error at Saturn is nine times
+        the miss that a degree at Earth is, and the miss is what shows.
+
+        The launch point is deliberately not fitted.  It is where the first leg
+        happens to start rather than something the conics were built to
+        reproduce, and letting it vote drags the flybys -- the points a viewer
+        can actually check against a planet -- off by more than it gains.
+        """
+        pts = np.asarray(self.pts, dtype=np.float64)
+        sin_sum = cos_sum = 0.0
+        for joint, body, jd in encounters:
+            p = pts[self.joints[joint]]
+            r = math.hypot(p[0], p[2])
+            delta = math.radians(body_longitude(body, jd)
+                                 - math.degrees(math.atan2(p[2], p[0])))
+            sin_sum += r * math.sin(delta)
+            cos_sum += r * math.cos(delta)
+        ang = math.atan2(sin_sum, cos_sum)
+        ca, sa = math.cos(ang), math.sin(ang)
+        x, z = pts[:, 0].copy(), pts[:, 2].copy()
+        pts[:, 0] = x * ca - z * sa
+        pts[:, 2] = x * sa + z * ca
+        self.pts = [p for p in pts]
+        return self
+
+    def path(self):
+        return (np.asarray(self.pts, dtype=np.float64) * AU_UNITS).astype(np.float32)
+
+
+# Parker Solar Probe's seven Venus gravity assists, each trading orbital energy
+# for a lower perihelion: (perihelion in SOLAR RADII, aphelion in AU).  The
+# perihelia are the published step-down -- 35.7 solar radii on the first
+# encounter in Nov 2018, 9.86 from 24 Dec 2024.  That last one is measured
+# from the Sun's CENTRE, which is what an orbit is: it puts Parker 6.1 million
+# km above the surface, the figure the mission quotes, and closer to a star
+# than anything else ever built.  The aphelia follow from the
+# orbital periods over the same steps (150 days at the start, 88 at the end);
+# they walk in from just short of Earth's orbit onto Venus's, which is the
+# point a Venus assist can no longer improve on.
+PSP_ORBITS = [(35.7, 0.937), (27.9, 0.877), (20.3, 0.818), (16.0, 0.746),
+              (13.3, 0.736), (11.4, 0.730), (9.86, 0.7233)]
 
 
 def _mission_paths():
-    """Illustrative real mission trajectories: correct sequence and distance
-    of every flyby, smoothly interpolated between them (see catmull_rom)."""
-    w = _helio_wp
-    missions = [
-        ("Voyager 1", (0.16, 0.46, 0.52), [
-            w(1.0, 0, 0), w(5.2, 35, 3), w(9.5, 65, 8), w(25, 85, 20),
-            w(60, 100, 28), w(100, 112, 32), w(121.6, 118, 34), w(165, 122, 35),
-        ]),
-        ("Voyager 2", (0.48, 0.20, 0.48), [
-            w(1.0, -10, 0), w(5.2, -35, -2), w(9.5, -60, -10), w(19.2, -85, -25),
-            w(30.1, -105, -38), w(60, -118, -44), w(100, -126, -47),
-            w(119.0, -130, -48), w(140, -133, -48),
-        ]),
-        ("New Horizons", (0.52, 0.30, 0.10), [
-            w(1.0, 15, 0), w(5.2, 25, 0.5), w(15, 40, 1), w(25, 52, 1.5),
-            w(33.0, 60, 2), w(43.4, 64, 2.3), w(58, 67, 2.6),
-        ]),
-        ("Pioneer 10", (0.24, 0.48, 0.24), [
-            w(1.0, -150, 0), w(2.8, -145, 0.5), w(5.2, -138, 1),
-            w(20, -128, 2), w(50, -120, 3), w(80, -115, 3.5),
-        ]),
-        ("Pioneer 11", (0.40, 0.46, 0.17), [
-            w(1.0, -160, 0), w(5.2, -150, 1), w(9.5, -135, 6),
-            w(30, -120, 14), w(44, -114, 16),
-        ]),
-        ("Cassini", (0.50, 0.42, 0.14), [
-            w(0.95, 170, 0), w(0.72, 160, 2), w(0.72, 178, -2), w(1.0, -170, 0),
-            w(2.5, -155, 0.5), w(5.2, -140, 1), w(9.0, -122, 1.2),
-            w(9.5, -118, 1.3), w(9.6, -113, 2.0), w(9.3, -121, 0.5), w(9.5, -117, 1.0),
-        ]),
-        ("Juno", (0.24, 0.34, 0.48), [
-            w(1.0, -60, 0), w(1.0, -50, 1), w(3.0, -40, 2), w(5.2, -25, 3),
-            w(5.35, -20, 8), w(5.1, -30, -6), w(5.2, -25, 3),
-        ]),
-        ("Parker Solar Probe", (0.55, 0.17, 0.09), [
-            w(1.0, 200, 0), w(0.72, 210, 1), w(0.166, 220, 0), w(0.72, 232, -1),
-            w(0.095, 245, 0), w(0.72, 258, 1), w(0.062, 270, 0),
-            w(0.72, 282, -1), w(0.045, 295, 0), w(0.3, 305, 0),
-        ]),
-    ]
-    return [{"name": name, "kind": "mission", "color": color,
-            "pos": catmull_rom(wps, samples_per_seg=20)}
-            for name, color, wps in missions]
+    """Real mission trajectories, built as patched conics and then aimed at the
+    planets they really flew past -- see Cruise and Cruise.aim_at.
+
+    How close each drawn flyby comes to its planet on the encounter date,
+    measured in the finished scene:
+
+        Parker/Venus 0.04   Voyager 2/Jupiter 0.08   Voyager 1/Jupiter 0.10
+        Voyager 1/Saturn 0.11   Pioneer 10/Jupiter 0.11   NH/Jupiter 0.11
+        Juno/Jupiter 0.21   Pioneer 11/Saturn 0.29   Cassini/Saturn 1.48
+        Voyager 2/Neptune 2.88                                        (AU)
+
+    A tenth of an AU at Saturn is a hundredth of the radius of its orbit: the
+    line goes through the planet.  The two that miss are the two whose drawn
+    shape cannot be turned into agreement, because one rotation cannot fix a
+    leg that sweeps the wrong angle -- Voyager 2 accumulates a few degrees over
+    four flybys, and Cassini's inner-system loops are the most simplified part
+    of any path here.
+    """
+    out = []
+
+    def add(name, color, c):
+        out.append({"name": name, "kind": "mission", "color": color, "pos": c.path()})
+
+    # --- Voyager 1: Jupiter Mar 1979, Saturn Nov 1980, where the Titan flyby
+    # throws it up and out of the ecliptic.  Its heliocentric orbit after
+    # Saturn is a hyperbola of eccentricity 3.71 whose perihelion IS the Saturn
+    # encounter, inclined 35.8 deg, which puts the outbound asymptote at
+    # ecliptic latitude +35 -- where Voyager 1 is really heading.  Heliopause
+    # crossing at 121.6 AU in Aug 2012; drawn out to the 170 AU it has reached,
+    # still the most distant object we have made.
+    c = Cruise(1.0, 0.0)
+    c.coast_to(1.00, 0.815, 5.2)
+    c.coast_to(4.90, 1.350, 9.5, tilt_deg=-2.0)
+    c.coast_to(9.50, 3.715, 170.0, tilt_deg=-34.8, n=260)
+    c.aim_at([(1, "Jupiter", julian_day(1979, 3, 5)),
+              (2, "Saturn", julian_day(1980, 11, 12))])
+    add("Voyager 1", (0.16, 0.46, 0.52), c)
+
+    # --- Voyager 2: the Grand Tour -- Jupiter Jul 1979, Saturn Aug 1981,
+    # Uranus Jan 1986, Neptune Aug 1989, still the only visit either ice giant
+    # has had.  It stays near the ecliptic the whole way across, because that
+    # is where all four planets are; the plunge south comes only at the end,
+    # where the Neptune flyby was aimed over the planet's north pole to reach
+    # Triton and left Voyager 2 on an orbit inclined 78.8 deg with its
+    # asymptote at ecliptic latitude -48.  Heliopause at 119 AU in Nov 2018;
+    # drawn out to 142 AU.
+    c = Cruise(1.0, 42.0)
+    c.coast_to(1.00, 0.810, 5.2)
+    c.coast_to(4.95, 1.300, 9.5, tilt_deg=1.0)
+    c.coast_to(9.30, 1.620, 19.2, tilt_deg=2.5)
+    c.coast_to(15.0, 1.300, 30.1, tilt_deg=1.0)
+    c.coast_to(20.45, 6.285, 142.0, tilt_deg=78.8, n=260)
+    c.aim_at([(1, "Jupiter", julian_day(1979, 7, 9)),
+              (2, "Saturn", julian_day(1981, 8, 26)),
+              (3, "Uranus", julian_day(1986, 1, 24)),
+              (4, "Neptune", julian_day(1989, 8, 25))])
+    add("Voyager 2", (0.48, 0.20, 0.48), c)
+
+    # --- Pioneer 10: first through the asteroid belt, first past Jupiter
+    # (Dec 1973), first onto an escape trajectory out of the Solar System.
+    # Jupiter left it on a hyperbola of eccentricity 1.73 barely 3 deg out of
+    # the ecliptic, aimed at Aldebaran.  Drawn only as far as the 80 AU it had
+    # reached when the last contact came in on 23 Jan 2003, which is the last
+    # place anyone actually knows it to have been: it has certainly coasted on
+    # since, but only the two Voyagers have a heliopause crossing anybody
+    # measured, and extending a silent spacecraft across that boundary would
+    # be drawing a guess in the same line weight as a fact.
+    c = Cruise(1.0, -150.0)
+    c.coast_to(0.99, 0.790, 5.2)
+    c.coast_to(5.00, 1.733, 80.0, tilt_deg=-3.1, n=260)
+    c.aim_at([(1, "Jupiter", julian_day(1973, 12, 4))])
+    add("Pioneer 10", (0.24, 0.48, 0.24), c)
+
+    # --- Pioneer 11: the one that took the long way round.  Jupiter (Dec 1974)
+    # threw it back up over the Solar System on an ellipse whose perihelion is
+    # the Jupiter encounter and whose aphelion is Saturn -- half a revolution
+    # and nearly five years later, on the far side of the Sun.  So it climbs
+    # to 16 deg above the ecliptic mid-crossing and comes back down to meet
+    # Saturn in Sep 1979, which then sent it out at ecliptic latitude +12.6.
+    # Drawn, like Pioneer 10, only to where it was last heard from -- 44.7 AU,
+    # out among the Kuiper belt, in Sep 1995.
+    c = Cruise(1.0, -160.0)
+    c.coast_to(0.99, 0.800, 5.2)
+    c.leg(5.20, 0.2925, 180.0, nu_start_deg=0.0, tilt_deg=-15.6, n=240)
+    c.coast_to(9.40, 2.147, 44.7, tilt_deg=-28.4, n=240)
+    c.aim_at([(1, "Jupiter", julian_day(1974, 12, 3)),
+              (2, "Saturn", julian_day(1979, 9, 1))])
+    add("Pioneer 11", (0.40, 0.46, 0.17), c)
+
+    # --- New Horizons: Jupiter Feb 2007, Pluto Jul 2015 at 32.9 AU, Arrokoth
+    # Jan 2019 at 43.4 AU.  Neither Kuiper belt flyby bent it measurably -- the
+    # bodies are far too small -- so everything past Jupiter is one unbroken
+    # hyperbola of eccentricity 1.41 and the two encounters are simply points
+    # it sails through.  Still transmitting, and drawn out to the 66 AU it has
+    # reached; the heliopause is another fifty AU ahead of it.
+    c = Cruise(1.0, 15.0)
+    c.coast_to(0.99, 0.980, 5.2)
+    c.coast_to(2.20, 1.410, 66.0, tilt_deg=2.3, n=260)
+    c.aim_at([(1, "Jupiter", julian_day(2007, 2, 28))])
+    add("New Horizons", (0.52, 0.30, 0.10), c)
+
+    # --- Cassini-Huygens: the VVEJGA tour, Venus-Venus-Earth-Jupiter Gravity
+    # Assist.  It could not reach Saturn directly, so it went inward first --
+    # Venus Apr 1998, then a long loop out to 1.58 AU and back for a second
+    # Venus pass Jun 1999, Earth two months after that, Jupiter Dec 2000,
+    # Saturn orbit insertion Jul 2004.  The 13-year, 294-orbit tour of Saturn
+    # that follows is not drawn: its widest apoapsis is well under a hundredth
+    # of the Sun-Saturn distance, so at this scale the entire tour is one point
+    # -- the point this path ends on.
+    c = Cruise(1.0, 170.0)
+    c.leg(0.68, 0.190, 308.9, nu_start_deg=180.0)
+    c.leg(0.68, 0.398, 322.2, nu_start_deg=37.8, tilt_deg=2.2, n=280)
+    c.coast_to(0.70, 0.650, 1.0, tilt_deg=-1.5)
+    c.coast_to(0.68, 0.870, 5.2, tilt_deg=-0.8)
+    c.coast_to(1.00, 0.802, 9.0, tilt_deg=1.5, n=220)
+    c.aim_at([(1, "Venus", julian_day(1998, 4, 26)),
+              (2, "Venus", julian_day(1999, 6, 24)),
+              (3, "Earth", julian_day(1999, 8, 18)),
+              (4, "Jupiter", julian_day(2000, 12, 30)),
+              (5, "Saturn", julian_day(2004, 7, 1))])
+    add("Cassini", (0.50, 0.42, 0.14), c)
+
+    # --- Juno: launched Aug 2011 too slow to reach Jupiter, onto a two-year
+    # ellipse out to 2.27 AU that brought it back past Earth in Oct 2013 for
+    # the assist it actually needed.  That near-closed loop is the signature of
+    # the trajectory and the reason Juno spent five years covering five AU; it
+    # is drawn closed, which is a fraction of a revolution tidier than the real
+    # one, whose two deep-space burns at aphelion left it slightly off.  Jupiter orbit insertion Jul 2016, close to
+    # Jupiter's own aphelion at 5.45 AU.  The 53-day polar capture orbit around
+    # Jupiter is smaller than the planet is drawn here, so the path ends on
+    # arrival.
+    c = Cruise(1.0, -20.0)
+    c.revolution(0.98, 0.397, n=300)
+    c.coast_to(0.98, 0.698, 5.45, tilt_deg=2.0, n=220)
+    c.aim_at([(1, "Earth", julian_day(2013, 10, 9)),
+              (2, "Jupiter", julian_day(2016, 7, 5))])
+    add("Juno", (0.24, 0.34, 0.48), c)
+
+    # --- Parker Solar Probe: a stack of nested ellipses, not a spiral inward.
+    # It launched Aug 2018 onto an orbit that drops it straight down to Venus
+    # seven weeks later, and each of the seven Venus assists since has shaved
+    # energy off the orbit -- pulling perihelion in from 35.7 solar radii to
+    # 9.86 while aphelion walks down from near Earth's orbit onto Venus's.
+    # Every one of those seven orbits is a CLOSED ellipse, flown over and over
+    # -- the final 88-day one comes back round every three months -- with
+    # perihelion and aphelion on OPPOSITE sides of the Sun, 180 deg apart; one
+    # full revolution of each is drawn.  Chaining them at the Venus crossing
+    # makes them share that point and fans the line of apsides round by about
+    # 30 deg across the set, the way the real one has moved.  The innermost
+    # passes run inside the Sun as drawn here, which is a statement about the
+    # drawn Sun being far larger than to scale rather than about the orbit:
+    # 9.86 solar radii is 6.7 times closer in than Mercury ever gets, crossed
+    # at 690,000 km/h -- the fastest anything built has ever moved.
+    c = Cruise(1.0, 200.0)
+    c.leg(0.45, 0.379, 248.0, nu_start_deg=180.0, n=140)
+    for i, (q_rsun, r_aph) in enumerate(PSP_ORBITS):
+        q = q_rsun * R_SUN_AU
+        c.revolution(q, (r_aph - q) / (r_aph + q), tilt_deg=3.4 if i == 0 else 0.0, n=320)
+    c.aim_at([(1, "Venus", julian_day(2018, 10, 3))])
+    add("Parker Solar Probe", (0.55, 0.17, 0.09), c)
+
+    return out
 
 
-def preset_solar_system(rng):
+def preset_solar_system(rng, epoch_jd=None):
     """The Sun, the eight planets, the five IAU dwarf planets, their major
     moons, Saturn's rings, the asteroid and Kuiper belts, a thick Oort cloud
     shell, the heliosphere, and a handful of real space-mission trajectories.
@@ -974,89 +1610,74 @@ def preset_solar_system(rng):
     scattered populations, not individually tracked bodies), which is the
     standard, defensible approximation for a debris population.
 
+    WHERE each body sits on its orbit depends on epoch_jd.  Left None, every
+    body is dropped at a random true anomaly: the orbits are real, the
+    arrangement is not.  Given a Julian day, each is instead placed where it
+    really is on that date, from its mean longitude (see "putting the planets
+    where they really are" above) -- so the scene becomes a picture of the
+    actual sky, and running it forward from there is a forecast rather than a
+    doodle.  Both modes hand the integrator the same kind of state, so nothing
+    downstream knows or cares which one built it.
+
     Moons and ring dust are NOT part of the N-body gravity pass -- a global
     timestep tuned for year-long planetary orbits is far too coarse to
     integrate a day-long moon orbit (let alone a ring particle's faster one)
     without it flying apart or aliasing into a strobing mess.  Instead they
     are kinematic satellites (see the "kinematic satellites" Taichi section):
-    parented to their planet's live simulated position every frame, with an
-    angular rate set as a multiple of that planet's own orbital rate so
-    closer moons visibly move faster than farther ones, the way real moons do.
+    parented to their planet's live simulated position every frame, and swept
+    round it on a circle whose PLANE, PERIOD and PHASE are the real ones,
+    measured off JPL's ephemeris (the per-moon residuals are listed beside
+    SATURN_EQUATOR_INCL above).  So on a given date each
+    moon is on the correct side of its planet, going the correct way round, at
+    the correct speed -- Io and Europa where they really are in the Galilean
+    dance, Uranus's moons wheeling almost perpendicular to everything else
+    because Uranus is tipped over, Triton and Charon running backwards.
 
-    Phobos and Deimos are both given PROGRADE orbits deliberately: neither
-    real moon is retrograde (both orbit in the same sense as Mars's own
-    rotation, in its equatorial plane).  Phobos's real oddity is that it
-    orbits faster than Mars rotates, so it rises in the west and sets in the
-    east -- captured here as an unusually fast rate, not a reversed one,
-    since flipping it would trade one accurate detail for a wrong one.
+    The one thing that is not real is how FAR out they are drawn.  Jupiter is
+    drawn with a radius sixty times the size of Io's whole orbit, so a moon
+    placed to scale would be buried inside its own planet; the radii are
+    instead spread to a legible spacing that keeps the real ordering.  A moon
+    is therefore in the right direction from its planet, at the wrong distance
+    -- the same bargain the drawn planet radii themselves already make.
+    Saturn's rings are the exception, and are drawn at their true 1.55 to 2.30
+    Saturn radii.
+
+    Two consequences worth knowing.  Phobos comes out orbiting Mars three
+    times a day, faster than Mars turns, which is why it really does rise in
+    the west; nothing here had to be told that, it falls out of a 7.65-hour
+    period.  And at the speeds the panel offers, an inner moon completes
+    thousands of orbits a second and can only alias -- moon motion is
+    legible at a few days per second, and exact in real time.
     """
     G = 1.0
     m_sun = 1.0
-    # name, semi-major axis (AU), eccentricity, inclination/node/argument of
-    # perihelion (degrees, real orbital elements), mass (solar masses), draw
-    # radius, colour, moons as (orbit radius in multiples of the planet's own
-    # drawn radius, angular rate in multiples of the planet's own orbital
-    # rate, drawn size, colour, orbital inclination in degrees, retrograde)
-    bodies = [
-        ("Mercury", 0.38709893, 0.20563069, 7.00487, 48.33167, 77.45645,
-         1.66e-7, 0.45, (1.00, 0.86, 0.66), []),
-        ("Venus", 0.72333199, 0.00677323, 3.39471, 76.68069, 131.53298,
-         2.45e-6, 0.70, (1.00, 0.82, 0.50), []),
-        ("Earth", 1.00000011, 0.01671022, 0.00005, -11.26064, 102.94719,
-         3.00e-6, 0.72, (0.45, 0.68, 1.00), [
-            (1.9, 9.0, 0.11, (0.80, 0.80, 0.78), 8.0, False),                 # Moon
-        ]),
-        ("Mars", 1.52366231, 0.09341233, 1.85061, 49.57854, 336.04084,
-         3.23e-7, 0.58, (1.00, 0.48, 0.32), [
-            (1.5, 22.0, 0.045, (0.65, 0.55, 0.48), 4.0, False),               # Phobos (prograde, real)
-            (2.1, 12.0, 0.040, (0.60, 0.58, 0.55), 26.0, False),              # Deimos (prograde, real)
-        ]),
-        ("Ceres", 2.7691651, 0.0760090, 10.59406, 80.30553, 73.59764,
-         4.72e-10, 0.14, (0.62, 0.60, 0.58), []),
-        ("Jupiter", 5.20336301, 0.04839266, 1.30530, 100.55615, 14.75385,
-         9.55e-4, 1.70, (0.95, 0.80, 0.62), [
-            (2.3, 12.0, 0.15, (0.90, 0.78, 0.45), 3.0, False),                # Io
-            (3.0, 9.0, 0.13, (0.85, 0.80, 0.72), 5.0, False),                 # Europa
-            (3.9, 6.5, 0.17, (0.72, 0.66, 0.58), 7.0, False),                 # Ganymede
-            (5.0, 4.5, 0.16, (0.48, 0.44, 0.42), 9.0, False),                 # Callisto
-        ]),
-        ("Saturn", 9.53707032, 0.05415060, 2.48446, 113.71504, 92.43194,
-         2.86e-4, 1.50, (0.98, 0.88, 0.66), [
-            (2.6, 14.0, 0.075, (0.92, 0.94, 0.96), 15.0, False),              # Enceladus
-            (3.4, 10.0, 0.095, (0.80, 0.78, 0.72), 18.0, False),              # Rhea
-            (4.6, 7.0, 0.19, (0.90, 0.72, 0.42), 22.0, False),                # Titan
-        ]),
-        ("Uranus", 19.19126393, 0.04716771, 0.76986, 74.22988, 170.96424,
-         4.37e-5, 1.05, (0.62, 0.92, 0.96), [
-            (2.6, 8.0, 0.09, (0.72, 0.78, 0.85), 12.0, False),                # Titania
-        ]),
-        ("Neptune", 30.06896348, 0.00858587, 1.76917, 131.72169, 44.97135,
-         5.15e-5, 1.02, (0.42, 0.60, 1.00), [
-            (2.8, 9.0, 0.10, (0.62, 0.72, 0.95), 20.0, True),                 # Triton (retrograde, real)
-        ]),
-        ("Pluto", 39.48168677, 0.24880766, 17.14175, 110.30347, 224.06676,
-         6.55e-9, 0.26, (0.80, 0.68, 0.58), [
-            (2.2, 7.0, 0.13, (0.72, 0.70, 0.68), 6.0, False),                 # Charon
-        ]),
-        ("Haumea", 43.13, 0.19126, 28.2137, 121.900, 239.041,
-         2.02e-9, 0.19, (0.88, 0.90, 0.92), []),
-        ("Makemake", 45.79, 0.16126, 28.9835, 79.620, 294.834,
-         1.56e-9, 0.18, (0.72, 0.48, 0.38), []),
-        ("Eris", 67.78, 0.43607, 44.0445, 35.9531, 151.639,
-         8.35e-9, 0.25, (0.85, 0.85, 0.88), []),
-    ]
     P, V, M, S, C, R = [], [], [], [], [], []
     labels = [(0, "Sun")]
 
     P.append([0.0, 0.0, 0.0]); V.append([0.0, 0.0, 0.0])
-    M.append(m_sun); S.append(0.6); C.append([4.0, 3.1, 1.8]); R.append(2.6)
+    # Softening at the floor, NOT at the Sun's drawn radius.  k_accel softens
+    # with the source's own length, a = GM r / (r^2 + eps^2)^1.5, so a solar
+    # eps of 0.6 units (0.06 AU) is a real weakening of the Sun's pull where
+    # the planets actually are: 0.5% at Earth and 3.5% at Mercury.  The bodies
+    # are launched from kepler_state at the UNSOFTENED speed, so that deficit
+    # goes straight into the period -- Mercury came back 53 degrees short after
+    # one of its own years, Earth 4 degrees -- and a scene whose whole claim is
+    # that it shows a real date cannot afford either.  Nothing needs the
+    # softening: the closest anything gravitating comes to the Sun is Mercury's
+    # perihelion at 3.1 units, and the moons and rings are kinematic.
+    M.append(m_sun); S.append(0.01); C.append([4.0, 3.1, 1.8]); R.append(2.6)
 
-    moon_specs = []   # (parent_idx, planet_a, planet_rad, radius_mult, rate_mult, size, colour, incl_deg, retro)
-    saturn_idx = saturn_a = saturn_rad = None
+    moon_specs = []   # (parent_idx, planet_rad) + the moon's row from the table
+    saturn_idx = saturn_rad = None
     orbit_lines = []
-    for name, a_au, e, i_deg, node_deg, argp_deg, m, rad, c, moons in bodies:
-        a = a_au * 10.0
-        nu0 = rng.uniform(0.0, 2.0 * math.pi)
+    for (name, a_au, e, i_deg, node_deg, peri_deg, l0_deg, dl_cy,
+         m, rad, c, moons) in SOLAR_BODIES:
+        a = a_au * AU_UNITS
+        argp_deg = peri_deg - node_deg
+        if epoch_jd is None:
+            nu0 = rng.uniform(0.0, 2.0 * math.pi)
+        else:
+            nu0 = true_anomaly_at(epoch_jd, e, peri_deg, l0_deg, dl_cy)
         p_vec, v_vec = kepler_state(a, e, i_deg, node_deg, argp_deg, nu0, gm=G * m_sun)
         P.append(p_vec.tolist()); V.append(v_vec.tolist())
         M.append(m); S.append(0.25)
@@ -1066,10 +1687,10 @@ def preset_solar_system(rng):
         orbit_lines.append({"name": name, "kind": "orbit",
                             "color": (c[0] * 0.55, c[1] * 0.55, c[2] * 0.55),
                             "pos": kepler_orbit_outline(a, e, i_deg, node_deg, argp_deg)})
-        for radius_mult, rate_mult, size, mc, incl_deg, retro in moons:
-            moon_specs.append((parent_idx, a, rad, radius_mult, rate_mult, size, mc, incl_deg, retro))
+        for moon in moons:
+            moon_specs.append((parent_idx, rad) + tuple(moon))
         if name == "Saturn":
-            saturn_idx, saturn_a, saturn_rad = parent_idx, a, rad
+            saturn_idx, saturn_rad = parent_idx, rad
 
     n_src = len(P)
 
@@ -1078,10 +1699,21 @@ def preset_solar_system(rng):
         r = np.sqrt(r0 * r0 + u * (r1 * r1 - r0 * r0))
         ph = rng.uniform(0, 2 * math.pi, count)
         vc = np.sqrt(G * m_sun / r) * (1.0 + rng.normal(0, ecc, count))
-        P.extend(np.stack([r * np.cos(ph), rng.normal(0, thick, count),
+        # Vertical state at a random PHASE of the oscillation rather than at
+        # rest above the plane.  A Keplerian disk's vertical frequency is its
+        # orbital one, so a belt laid down at its turning points with no
+        # vertical motion has every particle at a given radius cross the
+        # midplane at the same instant: the belt collapses to a razor-thin
+        # sheet a quarter of an orbit in, puffs back out, and goes on doing it.
+        # Drawing an amplitude and a phase independently gives a slab of
+        # steady thickness instead -- the same rms height, in equilibrium.
+        omega = np.sqrt(G * m_sun / r) / r
+        amp = rng.normal(0.0, thick * math.sqrt(2.0), count)
+        zph = rng.uniform(0, 2 * math.pi, count)
+        P.extend(np.stack([r * np.cos(ph), amp * np.cos(zph),
                            r * np.sin(ph)], axis=1).tolist())
         V.extend(np.stack([-vc * np.sin(ph),
-                           rng.normal(0, 0.004, count) * vc,
+                           -amp * omega * np.sin(zph),
                            vc * np.cos(ph)], axis=1).tolist())
         M.extend([0.0] * count); S.extend([0.05] * count); R.extend([rad] * count)
         shade = rng.uniform(0.55, 1.35, count)[:, None]
@@ -1117,35 +1749,62 @@ def preset_solar_system(rng):
 
     sat_parent, sat_u, sat_v, sat_radius, sat_rate, sat_phase0 = [], [], [], [], [], []
 
-    def add_moon(parent_idx, planet_a, planet_rad, radius_mult, rate_mult, size, color, incl_deg, retro):
-        omega_planet = math.sqrt(G * m_sun / planet_a) / planet_a
-        rot = _rot_matrix(math.radians(incl_deg), rng.uniform(0, 2 * math.pi))
+    def orbit_rate(period_days):
+        """Angular rate in radians per SIM time unit, from a period in days.
+        Fixed by the scene's units -- see YEAR_UNITS -- with nothing left to
+        tune, which is what lets a moon keep the real time it keeps."""
+        return 2.0 * math.pi / period_days * SIM_YEAR_DAYS / YEAR_UNITS
+
+    def add_moon(parent_idx, planet_rad, name, radius_mult, size, color,
+                 period_days, incl_deg, node_deg, u0_deg):
+        u_ax, v_ax = orbit_plane_axes(incl_deg, node_deg)
         P.append([0.0, 0.0, 0.0]); V.append([0.0, 0.0, 0.0])
         M.append(0.0); S.append(0.03)
         C.append([color[0] * 1.9, color[1] * 1.9, color[2] * 1.9]); R.append(size)
         sat_parent.append(parent_idx)
-        sat_u.append(rot @ np.array([1.0, 0.0, 0.0]))
-        sat_v.append(rot @ np.array([0.0, 0.0, 1.0]))
+        sat_u.append(u_ax); sat_v.append(v_ax)
         sat_radius.append(radius_mult * planet_rad)
-        sat_rate.append((-1.0 if retro else 1.0) * omega_planet * rate_mult)
-        sat_phase0.append(rng.uniform(0, 2 * math.pi))
+        sat_rate.append(orbit_rate(period_days))
+        # Dated, the moon starts at the argument of latitude it really has on
+        # the day: its J2000 value carried forward at its own rate.  Undated,
+        # there is no day for it to be the phase OF, so it gets a random one
+        # exactly as the planets do.
+        if epoch_jd is None:
+            sat_phase0.append(rng.uniform(0, 2 * math.pi))
+        else:
+            turns = math.radians(u0_deg) + 2.0 * math.pi / period_days * (epoch_jd - J2000_JD)
+            # Wrapped before it is stored, because the field is float32: a
+            # century of Phobos is a million radians, and a million radians in
+            # float32 has lost the tenth of a degree the wrap keeps.
+            sat_phase0.append(math.fmod(turns, 2.0 * math.pi))
 
     for spec in moon_specs:
         add_moon(*spec)
 
-    def saturn_ring(parent_idx, planet_a, planet_rad, count):
+    def saturn_ring(parent_idx, planet_rad, count):
         """Many independently-phased kinematic tracers rather than a static
         disk, so the ring visibly differentially-rotates the way a real one
-        does -- inner material laps the outer edge many times over."""
+        does -- inner material laps the outer edge many times over.
+
+        The one part of this scene that IS drawn to scale: the rings really do
+        run from 1.55 to 2.30 Saturn radii, so a ring particle's drawn radius
+        is its true one and it can be given its true Keplerian period -- eight
+        hours at the inner edge, fifteen at the outer.  They lie in Saturn's
+        equatorial plane, the same plane its moons were just placed in, which
+        is what stops the rings and Titan disagreeing about where Saturn's
+        equator is."""
         r0, r1 = 1.55 * planet_rad, 2.30 * planet_rad
-        gap_lo, gap_hi = 1.86 * planet_rad, 1.95 * planet_rad   # Cassini-division-style gap
+        # The Cassini division: 117,580-122,170 km, which is 1.951-2.027
+        # Saturn radii, so it lands where the real gap is rather than near it.
+        gap_lo, gap_hi = 1.951 * planet_rad, 2.027 * planet_rad
         r = r0 + rng.uniform(0.0, 1.0, count) * (r1 - r0)
         r = r[~((r > gap_lo) & (r < gap_hi))]
         n = r.shape[0]
-        omega_planet = math.sqrt(G * m_sun / planet_a) / planet_a
-        rate = omega_planet * 10.0 * (r0 / r) ** 1.5
-        rot = _rot_matrix(math.radians(26.7), math.radians(35.0))   # Saturn's real obliquity
-        u_ax, v_ax = rot @ np.array([1.0, 0.0, 0.0]), rot @ np.array([0.0, 0.0, 1.0])
+        # Period of a circular orbit one Saturn radius out: 2 pi sqrt(R^3/GM)
+        # with R = 60268 km and GM = 3.7931e7 km^3/s^2.  Every other radius
+        # follows by Kepler's third law, which is the differential rotation.
+        rate = orbit_rate(0.174706 * (r / planet_rad) ** 1.5)
+        u_ax, v_ax = orbit_plane_axes(SATURN_EQUATOR_INCL, SATURN_EQUATOR_NODE)
         band = np.clip((r - r0) / (r1 - r0), 0.0, 1.0)
         shade = (0.55 + 0.55 * rng.uniform(0.0, 1.0, n)) * (1.0 - 0.35 * np.sin(band * 9.0) ** 2)
         tint = np.array([0.86, 0.80, 0.62])
@@ -1158,9 +1817,7 @@ def preset_solar_system(rng):
         sat_radius.extend(r.tolist()); sat_rate.extend(rate.tolist())
         sat_phase0.extend(rng.uniform(0, 2 * math.pi, n).tolist())
 
-    saturn_ring(saturn_idx, saturn_a, saturn_rad, 4000)
-
-    satellites = (sat_parent, np.array(sat_u), np.array(sat_v), sat_radius, sat_rate, sat_phase0)
+    saturn_ring(saturn_idx, saturn_rad, 4000)
 
     # Heliosphere / heliopause: a static (non-orbiting -- it is a plasma
     # standoff boundary shaped by the solar wind, not gravitating debris)
@@ -1202,10 +1859,36 @@ def preset_solar_system(rng):
 
     polylines = orbit_lines + _mission_paths()
 
+    # --- handedness ---------------------------------------------------------
+    # Everything above is assembled in a frame where a prograde orbit runs from
+    # +x toward +z -- the sense the belts, the rings and the mission arcs were
+    # all written to agree with.  Seen from sim +y, which is the ecliptic north
+    # pole and where the default camera sits, that comes out CLOCKWISE, and the
+    # real Solar System seen from ecliptic north goes the other way: as built,
+    # the scene is a mirror image of the sky.
+    #
+    # It was unnoticeable while every planet sat at a random longitude -- a
+    # mirrored random arrangement is just another random arrangement.  On a
+    # real date it is the difference between the picture and the sky, so the
+    # scene is reflected through x here: one flip, applied to every position,
+    # velocity, satellite axis and drawn line at once, so every internal
+    # agreement made above survives it untouched, while the two reflections
+    # compose into a plain rotation -- ecliptic north still at +y, and the
+    # planets now going round it the way they really do.
+    P = np.asarray(P, dtype=np.float64); P[:, 0] *= -1.0
+    V = np.asarray(V, dtype=np.float64); V[:, 0] *= -1.0
+    sat_u_arr, sat_v_arr = np.array(sat_u), np.array(sat_v)
+    if sat_u_arr.size:
+        sat_u_arr[:, 0] *= -1.0
+        sat_v_arr[:, 0] *= -1.0
+    satellites = (sat_parent, sat_u_arr, sat_v_arr, sat_radius, sat_rate, sat_phase0)
+    for pl in polylines:
+        pl["pos"] = pl["pos"] * np.array([-1.0, 1.0, 1.0], dtype=np.float32)
+
     return Scene("Solar System", P, V, M, S, C, R,
                  n_src=n_src, n_dynamic=n_dynamic, satellites=satellites,
                  labels=labels, polylines=polylines, extras=extras,
-                 gconst=G, dt=0.06, substeps=3,
+                 gconst=G, dt=0.06, substeps=3, epoch_jd=epoch_jd,
                  cam_dist=150.0, cam_pitch=0.42, gain=1.6, kill_drift=False)
 
 
@@ -1428,10 +2111,6 @@ def preset_black_hole(rng):
         "r_start": 96.0,     # where it is actually dropped -- see make_star
         "r_peri": 17.0,      # pericentre, deep inside the tidal radius
         "soft": 0.05,
-        # softening for the massive subset: about the spacing between them in
-        # the star's core, so they model a smooth potential rather than
-        # scattering off one another
-        "soft_src": 0.30,
         "gm": gm,
         "rs": rs,
     }
@@ -1452,8 +2131,9 @@ def make_star(cfg, n, rng, phi=0.5 * math.pi, n_src=None):
     slow crawl through apocentre is where nearly all of the period goes, and
     starting below it means the stretch and the shredding begin within seconds
     instead of a minute of watching a dot drift.  The radial and tangential
-    velocity components come straight from vis-viva plus the orbit's angular
-    momentum, so the starting state sits exactly on the intended ellipse."""
+    velocity components come straight from the energy and angular momentum of
+    the intended orbit -- in the Paczynski-Wiita potential the hole is actually
+    integrated with, so the star's pericentre really is the one asked for."""
     m_star, r_star = cfg["m_star"], cfg["r_star"]
     r_apo, r_peri, gm = cfg["r_apo"], cfg["r_peri"], cfg["gm"]
 
@@ -1461,13 +2141,42 @@ def make_star(cfg, n, rng, phi=0.5 * math.pi, n_src=None):
     # a little longer than its envelope, which is what puts the kink in the
     # stream and keeps the two tidal tails clearly separate rather than letting
     # the whole thing smear into one even fan.
-    p, v = plummer_sphere(n, m_star, r_star * 0.42, 1.0, rng, rcut=2.4)
+    p, v = plummer_sphere(n, m_star, r_star * STAR_PLUMMER_A, 1.0, rng, rcut=2.4)
 
-    a_orb = 0.5 * (r_apo + r_peri)
-    ecc = (r_apo - r_peri) / (r_apo + r_peri)
+    # Re-centre the draw before it is placed.  A finite sample of a Plummer
+    # sphere has its own centre of mass a little off the origin and drifting a
+    # little, by order sigma/sqrt(N) -- and for a compact star sigma is
+    # comparable to the orbital speed itself, so that sampling noise was worth
+    # several percent of the orbit.  The pericentre then came out scattered
+    # either side of the one asked for (15.9 to 17.9 r_s across three star
+    # radii) for no reason but the seed.  Subtracting the sample's own mean
+    # state puts the body's centre of mass exactly on the intended orbit and
+    # leaves the ball otherwise untouched.
+    n_src_c = max(1, min(int(n_src or n), n))
+    p -= p[:n_src_c].mean(axis=0)
+    v -= v[:n_src_c].mean(axis=0)
+
     r0 = float(np.clip(cfg.get("r_start", r_apo), r_peri * 1.6, r_apo))
-    v0 = math.sqrt(max(gm * (2.0 / r0 - 1.0 / a_orb), 0.0))
-    l_orb = math.sqrt(max(gm * a_orb * (1.0 - ecc * ecc), 0.0))
+    rs = float(cfg.get("rs", 0.0))
+    if rs > 0.0:
+        # The hole is integrated with the Paczynski-Wiita potential,
+        # Phi = -GM/(r - r_s), so the energy and angular momentum that put the
+        # apsides at r_peri and r_apo are that potential's, not Newton's.
+        # Solving the Newtonian vis-viva instead -- which is what this did --
+        # left the star measurably off the orbit it was advertised as being on:
+        # with the defaults it reached 15.7 r_s rather than the 17 the panel
+        # was computing beta against.
+        ap, pp = r_apo - rs, r_peri - rs
+        denom = 1.0 / (r_peri * r_peri) - 1.0 / (r_apo * r_apo)
+        l2 = 2.0 * gm * (1.0 / pp - 1.0 / ap) / max(denom, 1e-30)
+        en = 0.5 * l2 / (r_apo * r_apo) - gm / ap
+        l_orb = math.sqrt(max(l2, 0.0))
+        v0 = math.sqrt(max(2.0 * (en + gm / max(r0 - rs, 1e-6)), 0.0))
+    else:
+        a_orb = 0.5 * (r_apo + r_peri)
+        ecc = (r_apo - r_peri) / (r_apo + r_peri)
+        l_orb = math.sqrt(max(gm * a_orb * (1.0 - ecc * ecc), 0.0))
+        v0 = math.sqrt(max(gm * (2.0 / r0 - 1.0 / a_orb), 0.0))
     v_tan = l_orb / r0
     v_rad = -math.sqrt(max(v0 * v0 - v_tan * v_tan, 0.0))   # inbound
 
@@ -1489,7 +2198,16 @@ def make_star(cfg, n, rng, phi=0.5 * math.pi, n_src=None):
     m = np.zeros(n, dtype=np.float32)
     m[:n_src] = m_star / n_src
     s = np.full(n, cfg["soft"], dtype=np.float32)
-    s[:n_src] = cfg.get("soft_src", cfg["soft"])
+    # Softening for the massive subset: the spacing between them in the star's
+    # core, so they model a smooth potential rather than scattering off one
+    # another.  Derived from the ball rather than fixed, because the panel lets
+    # the star radius go down to 0.5 r_s -- where a scale radius of 0.21 sits
+    # INSIDE a fixed 0.30 softening, the ball has no self-gravity left to hold
+    # it together, and it dissolves for numerical reasons while the panel
+    # reports it surviving the pass.  At the default star this evaluates to
+    # 0.30, which is the number it replaces.
+    s[:n_src] = cfg.get("soft_src",
+                        r_star * STAR_PLUMMER_A / max(n_src, 1) ** (1.0 / 3.0))
     return (np.ascontiguousarray(p, dtype=np.float32),
             np.ascontiguousarray(v, dtype=np.float32), m, s)
 
@@ -1525,6 +2243,11 @@ PRESETS = {
     3: preset_black_hole,
     4: preset_cluster,
 }
+
+# Scenes that can be built for a real calendar date, and so take a Julian day
+# as well as the RNG.  Only one has an ephemeris to be placed from: a galaxy
+# merger or a collapsing cluster has no date to be at.
+DATED_PRESETS = {1}
 
 
 # ---------------------------------------------------------------------------
@@ -2171,8 +2894,14 @@ void main() {
                 float radial = smoothstep(0.0, 0.10, tn) * (1.0 - smoothstep(0.45, 1.0, tn));
                 float emis = pow(u_diskIn / rr, 2.1);
 
-                // orbital velocity of the emitting gas (c = 1, r_s = 1 -> GM = 1/2)
-                vec3 vel = normalize(cross(vec3(0.0, 1.0, 0.0), x)) * u_spin * sqrt(0.5 / rr);
+                // Orbital velocity of the emitting gas (c = 1, r_s = 1 -> GM
+                // = 1/2).  The speed a local static observer measures for a
+                // circular geodesic is sqrt(M/(r - 2M)) = sqrt(0.5/(r - 1)),
+                // not the Newtonian sqrt(0.5/r): at the ISCO that is 0.5c
+                // against 0.41c, and it is this speed -- not the coordinate
+                // one -- that the Doppler factor below is a function of.
+                vec3 vel = normalize(cross(vec3(0.0, 1.0, 0.0), x)) * u_spin
+                         * sqrt(0.5 / max(rr - 1.0, 0.12));
                 vec3 nobs = -normalize(v);
                 float b2 = clamp(dot(vel, vel), 0.0, 0.98);
                 float gam = inversesqrt(1.0 - b2);
@@ -2827,6 +3556,24 @@ class Sim:
         self.speed = 1.0
         self.paused = False
         self.rng = np.random.default_rng()
+        # Julian day the Solar System is built for, or None for the original
+        # random-longitude arrangement.  Held here rather than on the scene so
+        # it survives a restart and a trip through the other scenes.
+        self.epoch_jd = ARGS_EPOCH_JD
+        # Run the clock at wall-clock speed -- one real second is one simulated
+        # second -- instead of at dt * speed, which crosses a fortnight every
+        # second and carries a scene built for "now" straight off the present.
+        # Only means anything in a dated scene; there is no real time to keep
+        # in one that is not at a date.
+        self.real_time = ARGS_REAL_TIME
+        self.wall_prev = None   # time.time() at the last frame the clock moved
+        # Was the date asked for "now" rather than a particular day?  If it
+        # was, the scene is stamped with the instant it is BUILT, not the one
+        # the arguments were read at -- otherwise a live view opens already
+        # behind by however long the shaders took to compile, and a restart
+        # would put it back to the moment the program started rather than to
+        # the present.
+        self.epoch_is_now = ARGS_EPOCH_IS_NOW
         # tidal-disruption controls
         self.self_gravity = True
         self.viscosity = 0.0025     # circularisation rate, 1 / time unit -- low
@@ -2848,13 +3595,26 @@ class Sim:
         self.jet_range = 70.0       # jet material is returned to the disk past here
         self.jet_source = 18.0      # jets are fed from inside this radius
         self.jet_base = 2.2         # launch height above the hole
-        self.jet_speed = 0.88       # launch speed (c = 1), above local escape
+        # Launch speed, c = 1.  This has to beat escape in the potential the
+        # material is integrated in, which is Paczynski-Wiita: v_esc =
+        # sqrt(2GM/(r - r_s)) = 0.91 at the 2.2 r_s launch height, not the
+        # Newtonian sqrt(2GM/r) = 0.67.  At 0.88 the beam was bound -- it
+        # turned round at 18 r_s and rained back into the disk, while the
+        # drawn jet went on to 70, so the two disagreed about how long the
+        # jet was.  Above escape it coasts out to the return radius and is
+        # recycled from there, which is the loop the code was written for.
+        self.jet_speed = 0.95
         self.jet_spread = 0.032     # opening angle as a fraction of jet speed
         self.circularising = False  # switched on once the star reaches pericentre
 
     def load(self, key):
         self.key = key
-        self.scene = PRESETS[key](self.rng)
+        if self.epoch_is_now and self.epoch_jd is not None:
+            self.epoch_jd = today_jd()
+        if key in DATED_PRESETS:
+            self.scene = PRESETS[key](self.rng, self.epoch_jd)
+        else:
+            self.scene = PRESETS[key](self.rng)
         s = self.scene
         if s.n > MAX_N:
             raise RuntimeError(f"scene {s.name} needs {s.n} particles, MAX_N is {MAX_N}")
@@ -2870,9 +3630,47 @@ class Sim:
         lo, hi = self.src_bounds()
         k_accel(s.n_dynamic, lo, hi, s.gconst, s.pw_rs)
         self.time = 0.0
+        # Re-anchor the wall clock too: a scene rebuilt at a new date must not
+        # inherit a stopwatch that has been running since the last one.
+        self.wall_prev = None
         self.circularising = False
         self.star_intact = False
         return s
+
+    def live(self):
+        """Is the clock following the wall clock this frame?  Real time needs a
+        scene that has a date for it to mean anything."""
+        return self.real_time and self.scene is not None and self.scene.epoch_jd is not None
+
+    def hold_clock(self):
+        """Let the wall clock run without the simulation following it -- what
+        pausing has to do, so that resuming carries on from where it stopped
+        rather than teleporting forward by the length of the pause."""
+        self.wall_prev = time.time()
+
+    def real_time_dt(self):
+        """Sim time units to advance this frame so the run keeps pace with the
+        wall clock, one second per second.  Clamped (see REALTIME_MAX_CATCHUP)
+        and self-anchoring: the first frame after the mode is switched on
+        advances nothing, it only starts the stopwatch."""
+        now = time.time()
+        prev, self.wall_prev = self.wall_prev, now
+        if prev is None:
+            return 0.0
+        secs = min(max(now - prev, 0.0), REALTIME_MAX_CATCHUP)
+        return secs / 86400.0 / SIM_YEAR_DAYS * YEAR_UNITS
+
+    def current_jd(self):
+        """The date the run has reached, as a Julian day, or None if the scene
+        was not built for one.  Sim time is a real elapsed time in a scene
+        whose units are pinned to the AU and the solar mass, so the clock is
+        simply the starting date plus however far the integrator has walked --
+        no separate bookkeeping, and it stays right through pausing, stepping
+        and every change of speed."""
+        s = self.scene
+        if s is None or s.epoch_jd is None:
+            return None
+        return s.epoch_jd + self.time / YEAR_UNITS * SIM_YEAR_DAYS
 
     def src_bounds(self):
         """Which particles act as gravity sources this step, as a half-open
@@ -2931,7 +3729,16 @@ class Sim:
 
     def step(self):
         s = self.scene
-        dt = s.dt * self.speed
+        if self.live():
+            # A frame's worth of real time is a few millionths of a time unit
+            # here, so the integrator is being asked for a far finer step than
+            # it was tuned for rather than a coarser one: accurate, cheap, and
+            # the planets move exactly as slowly as the real ones do.
+            dt = self.real_time_dt() / max(s.substeps, 1)
+            if dt <= 0.0:
+                return
+        else:
+            dt = s.dt * self.speed
         # Self-gravity is only what holds a star together on the way in; once
         # it is a spread-out stream the hole dominates utterly, so the source
         # range collapses to the hole afterwards and the cost drops from
@@ -3025,6 +3832,10 @@ class App:
         self.show_gui = True
         self.show_labels = False
         self.show_orbits = False
+        # Year/month/day the date box is showing.  Only handed to the sim when
+        # Apply is pressed, so typing a year is not four scene rebuilds.
+        self.date_ymd = list(calendar_date(sim.epoch_jd if sim.epoch_jd is not None
+                                           else today_jd()))
         self.extras_on = {}    # name -> bool, populated fresh per scene
         self.mission_on = {}   # mission name -> bool, populated fresh per scene
         self.auto_disk = True  # let the ray-marched disk grow in from the debris
@@ -3087,76 +3898,84 @@ class App:
         alive = r_sub < 1.0e3
         n_alive = int(alive.sum())
         if n_alive == 0:
+            # The hole has finished its meal.  This used to return, which
+            # left the disk and the jets frozen at whatever brightness they
+            # last had -- beams still blazing over an empty hole for the
+            # rest of the run.  There is nothing left to accrete, so fall
+            # through to the easing below with the targets at zero and let
+            # them go out the same way they came in.
             self.debris_frac = 0.0
-            return
-
-        r_alive = r_sub[alive]
-        if not sim.circularising and r_alive.min() < 1.35 * s.star_cfg["r_peri"]:
-            # pericentre reached, so whatever came off the star is now a stream
-            # that wants the viscous damping turned on
-            sim.circularising = True
-
-        # "Disk-like" means on a near-circular orbit, not merely nearby: an
-        # intact star coasting through apocentre has little radial motion too,
-        # and must not be mistaken for a disk.  Comparing its angular momentum
-        # against the circular value at the same radius separates the two.
-        #
-        # Measured a few times a second rather than every frame: it needs the
-        # velocities, and pulling those back off the GPU is the most expensive
-        # thing in this function.  Nothing it feeds moves quickly -- they are
-        # all eased towards over seconds -- so the targets are simply held
-        # between measurements, and the easing below still runs every frame.
-        self.tde_tick = (self.tde_tick + 1) % 4
-        if self.tde_tick == 0:
-            # Is the star still a star?  This used to be assumed rather than
-            # measured -- self-gravity was switched off the moment the star
-            # reached pericentre, on the grounds that by then it is a stream.
-            # For the default star it is.  For a dense one on a wide pericentre
-            # it is not, and switching its gravity off was what tore it apart:
-            # the panel would say it survives the pass and it would come apart
-            # anyway.  So ask the particles instead.
-            lo = s.star_lo
-            if lo >= 1 and lo + s.star_n <= s.n_dynamic:
-                blk = positions[lo:lo + s.star_n:step]
-                self.star_core = np.median(blk, axis=0)
-                d_core = np.linalg.norm(blk - self.star_core, axis=1)
-                self.star_bound = float(
-                    (d_core < 1.5 * s.star_cfg["r_star"]).mean())
-            else:
-                self.star_bound = 0.0
-            sim.star_intact = self.star_bound > 0.50
-
-            vel_all = vel.to_numpy()[1:s.n_dynamic:step][alive]
-            p_alive = sub[alive]
-            rhat = p_alive / r_alive[:, None]
-            v_r = np.abs(np.sum(vel_all * rhat, axis=1))
-            v_c = np.sqrt(0.5 * r_alive) / np.maximum(r_alive - s.pw_rs, 1e-3)
-            l_mag = np.linalg.norm(np.cross(p_alive, vel_all), axis=1)
-            kappa = l_mag / np.maximum(r_alive * v_c, 1e-9)
-            disky = ((r_alive < 60.0) & (v_r < 0.30 * v_c)
-                     & (kappa > 0.75) & (kappa < 1.3))
-            cnt = int(disky.sum())
-            self.debris_frac = cnt / float(n_alive)
-
             self.tgt_disk = (0.0, s.disk_in, s.disk_out)
-            if cnt > 60:
-                rr = r_alive[disky]
-                # 70th percentile, not 90th: a long-lived disk always has some
-                # scattered material way out past the body of it, and letting
-                # that set the outer edge inflates the drawn disk until it
-                # swallows the frame and flattens the temperature gradient
-                self.debris_inner = float(np.percentile(rr, 8))
-                self.debris_outer = float(np.percentile(rr, 70))
-                # Pinned near the ISCO rather than following the debris.
-                # Inside the ISCO material plunges in a few orbits, so the
-                # particles there are always sparse -- but a real disk still
-                # radiates right down to it, and letting the drawn inner edge
-                # drift out to where the particles thin out leaves an obvious
-                # empty ring around the hole.
-                tgt_in = 3.2
-                self.tgt_disk = (self.disk_peak * min(1.0, self.debris_frac / 0.35),
-                                 tgt_in,
-                                 min(max(self.debris_outer, tgt_in + 3.0), 36.0))
+            self.star_bound = 0.0
+            sim.star_intact = False
+        else:
+            r_alive = r_sub[alive]
+            if not sim.circularising and r_alive.min() < 1.35 * s.star_cfg["r_peri"]:
+                # pericentre reached, so whatever came off the star is now a stream
+                # that wants the viscous damping turned on
+                sim.circularising = True
+
+            # "Disk-like" means on a near-circular orbit, not merely nearby: an
+            # intact star coasting through apocentre has little radial motion too,
+            # and must not be mistaken for a disk.  Comparing its angular momentum
+            # against the circular value at the same radius separates the two.
+            #
+            # Measured a few times a second rather than every frame: it needs the
+            # velocities, and pulling those back off the GPU is the most expensive
+            # thing in this function.  Nothing it feeds moves quickly -- they are
+            # all eased towards over seconds -- so the targets are simply held
+            # between measurements, and the easing below still runs every frame.
+            self.tde_tick = (self.tde_tick + 1) % 4
+            if self.tde_tick == 0:
+                # Is the star still a star?  This used to be assumed rather than
+                # measured -- self-gravity was switched off the moment the star
+                # reached pericentre, on the grounds that by then it is a stream.
+                # For the default star it is.  For a dense one on a wide pericentre
+                # it is not, and switching its gravity off was what tore it apart:
+                # the panel would say it survives the pass and it would come apart
+                # anyway.  So ask the particles instead.
+                lo = s.star_lo
+                if lo >= 1 and lo + s.star_n <= s.n_dynamic:
+                    blk = positions[lo:lo + s.star_n:step]
+                    self.star_core = np.median(blk, axis=0)
+                    d_core = np.linalg.norm(blk - self.star_core, axis=1)
+                    self.star_bound = float(
+                        (d_core < 1.5 * s.star_cfg["r_star"]).mean())
+                else:
+                    self.star_bound = 0.0
+                sim.star_intact = self.star_bound > 0.50
+
+                vel_all = vel.to_numpy()[1:s.n_dynamic:step][alive]
+                p_alive = sub[alive]
+                rhat = p_alive / r_alive[:, None]
+                v_r = np.abs(np.sum(vel_all * rhat, axis=1))
+                v_c = np.sqrt(0.5 * r_alive) / np.maximum(r_alive - s.pw_rs, 1e-3)
+                l_mag = np.linalg.norm(np.cross(p_alive, vel_all), axis=1)
+                kappa = l_mag / np.maximum(r_alive * v_c, 1e-9)
+                disky = ((r_alive < 60.0) & (v_r < 0.30 * v_c)
+                         & (kappa > 0.75) & (kappa < 1.3))
+                cnt = int(disky.sum())
+                self.debris_frac = cnt / float(n_alive)
+
+                self.tgt_disk = (0.0, s.disk_in, s.disk_out)
+                if cnt > 60:
+                    rr = r_alive[disky]
+                    # 70th percentile, not 90th: a long-lived disk always has some
+                    # scattered material way out past the body of it, and letting
+                    # that set the outer edge inflates the drawn disk until it
+                    # swallows the frame and flattens the temperature gradient
+                    self.debris_inner = float(np.percentile(rr, 8))
+                    self.debris_outer = float(np.percentile(rr, 70))
+                    # Pinned near the ISCO rather than following the debris.
+                    # Inside the ISCO material plunges in a few orbits, so the
+                    # particles there are always sparse -- but a real disk still
+                    # radiates right down to it, and letting the drawn inner edge
+                    # drift out to where the particles thin out leaves an obvious
+                    # empty ring around the hole.
+                    tgt_in = 3.2
+                    self.tgt_disk = (self.disk_peak * min(1.0, self.debris_frac / 0.35),
+                                     tgt_in,
+                                     min(max(self.debris_outer, tgt_in + 3.0), 36.0))
 
         tgt_bright, tgt_in, tgt_out = self.tgt_disk
         if self.auto_disk:
@@ -3166,9 +3985,21 @@ class App:
             r.disk_bright += (tgt_bright - r.disk_bright) * k
             s.disk_in += (tgt_in - s.disk_in) * k
             s.disk_out += (tgt_out - s.disk_out) * k
-        # the jets are powered by accretion, so they light up with the disk
-        tgt_jet = self.jet_peak if (sim.jet and sim.circularising) else 0.0
-        tgt_jet *= min(1.0, self.debris_frac / 0.35)
+        # The jets are powered by accretion, so they live and die with the
+        # disk: once the hole has finished its meal there is nothing left to
+        # launch and the beams must go out with it.  Scaling them on
+        # debris_frac is not enough to do that, because debris_frac is a
+        # FRACTION -- as the disk drains, the count of disk-like particles and
+        # the count of surviving ones fall together, so the ratio can sit near
+        # 1 with almost nothing left, and the beams stay blazing over an empty
+        # hole.  The disk's own brightness already carries the absolute measure
+        # (it is held at zero below the handful-of-particles floor above), so
+        # drive the jets off that instead, and off the drawn brightness when
+        # the disk is being flown by hand rather than grown from the debris.
+        disk_now = tgt_bright if self.auto_disk else r.disk_bright
+        tgt_jet = 0.0
+        if sim.jet and sim.circularising and self.disk_peak > 1e-6:
+            tgt_jet = self.jet_peak * min(1.0, max(0.0, disk_now) / self.disk_peak)
         r.jet_bright += (tgt_jet - r.jet_bright) * 0.02
 
         self.star_glow += (self.star_bound - self.star_glow) * 0.02
@@ -3324,6 +4155,130 @@ def draw_labels(app, positions):
         dl.add_text(imgui.ImVec2(xy[0] + 8, xy[1] - 7), col, pl["name"])
 
 
+MONTH_DAYS = (31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+
+def draw_date_controls(app):
+    """The date box: switch the Solar System between bodies at random
+    longitudes and bodies placed where they really are on a chosen day, and
+    then show the date the run has walked forward to."""
+    sim, scene = app.sim, app.scene
+
+    imgui.separator_text("date")
+    dated = scene.epoch_jd is not None
+    changed, val = imgui.checkbox("place bodies on a real date", dated)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "On: every planet and dwarf planet starts where it really is on"
+            " the date below, from its published mean longitude -- the scene"
+            " becomes the actual sky, and running it forward is a forecast."
+            "\nOff: the same real orbits, but each body dropped at a random"
+            " point along its own.")
+    if changed:
+        sim.epoch_jd = julian_day(*app.date_ymd) if val else None
+        sim.epoch_is_now = False
+        app.load(1)
+        dated = val
+
+    imgui.begin_disabled(not dated)
+    imgui.push_item_width(-72)
+    changed, vals = imgui.input_int3("y / m / d", app.date_ymd)
+    if changed:
+        y, m, d = vals
+        m = max(1, min(12, int(m)))
+        # Clamped against the month rather than rolled over, so holding the
+        # stepper on the day field walks to the end of the month and stops
+        # instead of silently changing which month is being asked for.
+        app.date_ymd = [max(-4000, min(9999, int(y))), m,
+                        max(1, min(MONTH_DAYS[m - 1], int(d)))]
+    imgui.pop_item_width()
+
+    if imgui.button("Apply", imgui.ImVec2(84, 0)):
+        sim.epoch_jd = julian_day(*app.date_ymd)
+        sim.epoch_is_now = False
+        app.load(1)
+    imgui.same_line()
+    if imgui.button("J2000", imgui.ImVec2(84, 0)):
+        app.date_ymd = [2000, 1, 1]
+        sim.epoch_jd = J2000_JD
+        sim.epoch_is_now = False
+        app.load(1)
+    imgui.end_disabled()
+
+    # Left live even when the scene is not dated yet: "show me right now" is
+    # the whole point of the box, and it should not first need the mode above
+    # switching on by hand.
+    imgui.same_line()
+    if imgui.button("Now", imgui.ImVec2(84, 0)):
+        # This instant, seconds and all, with the clock locked to the wall
+        # clock -- asking to see now and then watching it race off the present
+        # would undo the one thing this button is for.
+        sim.epoch_jd = today_jd()
+        sim.real_time = True
+        sim.epoch_is_now = True
+        app.date_ymd = list(calendar_date(sim.epoch_jd))
+        app.load(1)
+        dated = True
+
+    imgui.begin_disabled(not dated)
+    changed, val = imgui.checkbox("run at real time  (1 s = 1 s)", sim.real_time)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(
+            "Advance the scene at wall-clock speed, so the date and time below"
+            " are the real ones and the planets crawl exactly as slowly as"
+            " they really do."
+            "\nOff, the speed slider takes over and a second of watching is"
+            " about a fortnight of Solar System.")
+    if changed:
+        sim.real_time = val
+        sim.wall_prev = None
+    imgui.end_disabled()
+
+    # Read the clock off whatever scene is loaded NOW: any of the buttons above
+    # may have rebuilt it a few lines ago, which leaves the local stale.
+    jd, epoch = sim.current_jd(), sim.scene.epoch_jd
+    if jd is None:
+        imgui.text_disabled("bodies at random longitudes")
+        return
+    y, m, d = calendar_date(jd)
+    hh, mm, ss = clock_time(jd)
+    years = (jd - epoch) / SIM_YEAR_DAYS
+    imgui.text(f"showing  {y:5d}-{m:02d}-{d:02d}  {hh:02d}:{mm:02d}:{ss:02d} UTC")
+    if sim.live() and not sim.epoch_is_now:
+        # Real time from a date that was never meant to be now: the rate is the
+        # real one, the moment is not, so there is nothing to be behind.
+        imgui.text_disabled(f"real time, {years:+.3f} yr from the start")
+    elif sim.live():
+        behind = (today_jd() - jd) * 86400.0
+        # Anything more than a second or two adrift was a pause, a minimised
+        # window or a sleeping machine -- say so, since the whole promise of
+        # this mode is that the clock on screen is the real one.
+        if abs(behind) < 2.0:
+            imgui.text_disabled("live -- tracking the wall clock")
+        else:
+            imgui.text_disabled(f"{behind / 60.0:.1f} min behind now -- press Now")
+    else:
+        imgui.text(f"elapsed  {years:+9.3f} yr")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Sim time is a real elapsed time here: the scene's length unit"
+                " is the AU and its mass unit the Sun, so one Earth orbit IS"
+                " one year. Pause, step or change the speed and the date still"
+                " follows the integrator.")
+    # The published elements are a fit over 1800-2050; a linear mean longitude
+    # keeps working outside it but the planets slide out of true, so say so
+    # rather than let a year-3000 screenshot pass for an ephemeris.
+    if not 1800 <= y <= 2050:
+        imgui.text_disabled("outside 1800-2050: approximate")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "The orbital elements are fitted over 1800-2050, where these"
+                " positions sit within a thousandth of an AU of JPL's for the"
+                " inner planets and a hundredth for the outer ones. Further"
+                " out the drift grows and they become indicative rather than"
+                " accurate.")
+
+
 def draw_gui(app):
     """Dear ImGui control panels. Every widget drives live state -- nothing here
     is cosmetic."""
@@ -3342,21 +4297,40 @@ def draw_gui(app):
     if imgui.button("Step", imgui.ImVec2(96, 0)):
         sim.step()
 
+    # In real time the step is dictated by how long the last frame took, so
+    # neither dial has anything left to say; they are greyed rather than hidden
+    # so it is clear which control is holding them, and where to give them back.
+    imgui.begin_disabled(sim.live())
     changed, val = imgui.slider_float("speed", sim.speed, 0.05, 16.0, "%.2fx",
                                       imgui.SliderFlags_.logarithmic)
     if changed:
         sim.speed = val
+    imgui.end_disabled()
     changed, val = imgui.slider_int("substeps", scene.substeps, 1, 8)
     if changed:
         scene.substeps = val
+    imgui.begin_disabled(sim.live())
     changed, val = imgui.slider_float("dt", scene.dt, 0.002, 0.4, "%.4f",
                                       imgui.SliderFlags_.logarithmic)
     if changed:
         scene.dt = val
+    imgui.end_disabled()
+    if sim.live():
+        imgui.text_disabled("speed and dt set by the real-time clock")
 
     imgui.separator_text("state")
     imgui.text(f"scene       {scene.name}")
-    imgui.text(f"sim time    {sim.time:10.2f}")
+    # A frame of real time is a few millionths of a time unit, so the usual
+    # two decimals would sit at 0.00 all session and read as a stalled clock.
+    imgui.text(f"sim time  {sim.time:12.6f}" if sim.live()
+               else f"sim time    {sim.time:10.2f}")
+    jd_now = sim.current_jd()
+    if jd_now is not None:
+        y, m, d = calendar_date(jd_now)
+        hh, mm, ss = clock_time(jd_now)
+        imgui.text(f"date        {y:5d}-{m:02d}-{d:02d}")
+        imgui.text(f"time     {hh:02d}:{mm:02d}:{ss:02d} UTC"
+                   + ("  live" if sim.live() else ""))
     imgui.text(f"particles   {scene.n:10d}")
     imgui.text(f"gravitating {scene.n_src:10d}")
     if scene.n_sat:
@@ -3487,8 +4461,11 @@ def draw_gui(app):
             app.star_sprite = val
 
         if cfg["m_star"] > 0.0:
-            # r_t = r_h (M_bh / M_star)^(1/3), with r_h = 1.3 a and a = r_star / 2
-            r_t = 0.65 * cfg["r_star"] * (0.5 / cfg["m_star"]) ** (1.0 / 3.0)
+            # r_t = r_h (M_bh / M_star)^(1/3), with r_h the ball's half-mass
+            # radius -- taken from the scale radius make_star actually builds
+            # it with, so the two cannot drift apart again
+            r_t = (STAR_HALF_MASS * cfg["r_star"]
+                   * (0.5 / cfg["m_star"]) ** (1.0 / 3.0))
             beta = r_t / max(cfg["r_peri"], 1e-6)
             verdict = "full disruption" if beta >= 1.0 else "survives the pass"
             col = imgui.ImVec4(0.5, 1.0, 0.6, 1.0) if beta >= 1.0 else imgui.ImVec4(1.0, 0.8, 0.4, 1.0)
@@ -3558,7 +4535,7 @@ def draw_gui(app):
     # --- solar system overlays ----------------------------------------------
     if scene.extras or scene.labels:
         imgui.set_next_window_pos(imgui.ImVec2(360, 12), imgui.Cond_.first_use_ever)
-        imgui.set_next_window_size(imgui.ImVec2(336, 300), imgui.Cond_.first_use_ever)
+        imgui.set_next_window_size(imgui.ImVec2(348, 520), imgui.Cond_.first_use_ever)
         imgui.begin("Solar System")
         changed, val = imgui.checkbox("body names  (N)", app.show_labels)
         if changed:
@@ -3566,6 +4543,10 @@ def draw_gui(app):
         changed, val = imgui.checkbox("orbit paths  (O)", app.show_orbits)
         if changed:
             app.show_orbits = val
+
+        if scene.name == "Solar System":
+            draw_date_controls(app)
+
         for name, _, count in scene.extras:
             changed, val = imgui.checkbox(name, app.extras_on.get(name, False))
             if changed:
@@ -3754,9 +4735,11 @@ def main():
                 elif ev.key == pygame.K_v:
                     renderer.gas_on = not renderer.gas_on
                 elif ev.key in (pygame.K_RIGHTBRACKET, pygame.K_EQUALS, pygame.K_KP_PLUS):
-                    app.sim.speed = min(app.sim.speed * 1.4, 16.0)
+                    if not app.sim.live():   # the wall clock owns the rate
+                        app.sim.speed = min(app.sim.speed * 1.4, 16.0)
                 elif ev.key in (pygame.K_LEFTBRACKET, pygame.K_MINUS, pygame.K_KP_MINUS):
-                    app.sim.speed = max(app.sim.speed / 1.4, 0.05)
+                    if not app.sim.live():
+                        app.sim.speed = max(app.sim.speed / 1.4, 0.05)
 
             if io.want_capture_mouse:
                 dragging = panning = False
@@ -3810,7 +4793,9 @@ def main():
             if keys[pygame.K_DOWN]:
                 cam.pan(0.0, 9.0)
 
-        if not app.sim.paused:
+        if app.sim.paused:
+            app.sim.hold_clock()
+        else:
             app.sim.step()
         positions = pos.to_numpy()[:scene.n]
         app.update_tde(positions)
