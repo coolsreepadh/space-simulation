@@ -5123,7 +5123,7 @@ def main():
         pygame.display.set_mode((w, h), flags, vsync=ARGS.vsync)
     except pygame.error:
         pygame.display.set_mode((w, h), flags)
-    pygame.display.set_caption("N-Body Universe + Ray-Marched Black Hole")
+    pygame.display.set_caption("Simulation Cluster")
 
     ctx = moderngl.create_context()
     renderer = Renderer(ctx, (w, h), ARGS.scale)
