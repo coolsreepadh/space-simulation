@@ -79,6 +79,8 @@ import time
 
 import numpy as np
 
+import bh_physics as bhp   # Kerr radii, pseudo-Newtonian force, jet power
+
 # ---------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------
@@ -161,7 +163,7 @@ def k_upload(n: ti.i32,
 
 @ti.kernel
 def k_accel(n: ti.i32, src_lo: ti.i32, src_hi: ti.i32,
-            gconst: ti.f32, pw_rs: ti.f32):
+            gconst: ti.f32, bh_rh: ti.f32, bh_beta: ti.f32):
     """Direct-sum gravity.
 
     Sources are indices [src_lo, src_hi): the massive bodies.  Every particle
@@ -174,21 +176,25 @@ def k_accel(n: ti.i32, src_lo: ti.i32, src_hi: ti.i32,
     since dominated by the hole, and including them would push the O(N^2)
     inner loop up by the square of the number of stars for no visible gain.
 
-    If pw_rs > 0 the body at index 0 is the hole and is always a source,
-    outside the range, through the Paczynski-Wiita pseudo-Newtonian
-    potential -GM/(r - r_s), which reproduces the Schwarzschild ISCO at 3 r_s
-    and makes orbits inside it plunge.  Callers in that case pass src_lo >= 1
-    so it is not also counted as an ordinary Newtonian source.
+    If bh_rh > 0 the body at index 0 is the hole and is always a source,
+    outside the range, through the Artemova-Bjornsson-Novikov (1996)
+    pseudo-Newtonian force for a SPINNING hole,
+        F = GM / (r^(2 - beta) (r - r_H)^beta),   beta = r_isco / r_H - 1,
+    which puts the horizon r_H and the ISCO at their true Kerr radii for the
+    hole's spin and makes orbits inside the ISCO plunge.  At zero spin it is
+    exactly the Paczynski-Wiita force this used to be, -GM/(r - r_s)^2.
+    Callers pass src_lo >= 1 so the hole is not also a Newtonian source.
     """
     for i in range(n):
         a = ti.Vector([0.0, 0.0, 0.0])
         pi = pos[i]
-        if pw_rs > 0.0:
+        if bh_rh > 0.0:
             d = pos[0] - pi
             r2 = d.dot(d) + sft2[0]
             r = ti.sqrt(r2)
-            rr = ti.max(r - pw_rs, 0.35 * pw_rs)
-            a += (gconst * mass[0] / (rr * rr * r)) * d
+            rr = ti.max(r - bh_rh, 0.35 * bh_rh)
+            a += (gconst * mass[0]
+                  / (ti.pow(r, 2.0 - bh_beta) * ti.pow(rr, bh_beta) * r)) * d
         for j in range(src_lo, src_hi):
             d = pos[j] - pi
             r2 = d.dot(d) + sft2[j]
@@ -245,6 +251,58 @@ BH_RS_KM = (2.0 * _G_SI * BH_SOLAR_MASSES * _SOLAR_MASS_KG / (_C_SI ** 2)) / 100
 SIM_MASS_TO_SOLAR = BH_SOLAR_MASSES / 0.5
 
 
+DISK_TPEAK_SHOWN = 6500.0   # K: white-hot inner disk, see Renderer.disk_tscaled
+DISK_TMIN_SHOWN = 3300.0    # K: the outer disk bottoms out at orange, not deep red
+
+
+def main_sequence_teff(m_sun):
+    """Surface temperature of a main-sequence star of m_sun solar masses, K.
+
+    From the mass-luminosity relation (Duric 2004; Salaris & Cassisi 2005)
+        L = 0.23 M^2.3        M < 0.43
+        L = M^4               0.43 <= M < 2
+        L = 1.4 M^3.5         2 <= M < 55
+    and the mass-radius relation R = M^0.8 (M <= 1), M^0.57 (M > 1), via
+    L = 4 pi R^2 sigma T^4, i.e. T = T_sun (L / R^2)^(1/4).  Gives ~3000 K at
+    0.2 M_sun (an M dwarf: red), 5772 K at 1 M_sun (the Sun: yellow-white),
+    ~14000 K at 4 M_sun (a B star: blue-white)."""
+    m = max(float(m_sun), 0.08)
+    if m < 0.43:
+        lum = 0.23 * m ** 2.3
+    elif m < 2.0:
+        lum = m ** 4.0
+    else:
+        lum = 1.4 * m ** 3.5
+    rad = m ** 0.8 if m <= 1.0 else m ** 0.57
+    return 5772.0 * (lum / (rad * rad)) ** 0.25
+
+
+class Kerr:
+    """Every radius of a hole of spin a (J c / G M^2), in r_s -- the world
+    unit of the black hole scene.  a > 0 turns the same way as the disk
+    (which always orbits the way the star is thrown in); a < 0 against it.
+    Formulas and checks in bh_physics.py (python bh_physics.py)."""
+
+    def __init__(self, a):
+        self.a = bhp.clamp_spin(a)
+        self.rh = 0.5 * bhp.horizon(self.a)          # outer event horizon
+        self.isco = 0.5 * bhp.isco(self.a)           # innermost stable orbit
+        self.rmb = 0.5 * bhp.marginally_bound(self.a)
+        self.ph_co = 0.5 * bhp.photon_orbit(self.a)  # photon orbits, with and
+        self.ph_counter = 0.5 * bhp.photon_orbit(-self.a)   # against the spin
+        self.beta = bhp.isco(self.a) / bhp.horizon(self.a) - 1.0
+        self.eta = bhp.efficiency(self.a)
+        # Capture: bound gas that gets inside the marginally bound orbit has
+        # no turning point left and will cross the horizon; it is taken out
+        # there rather than at the horizon, where the force is steep enough
+        # for a finite step to fling it back out.  Never inside 1.1 r_H.
+        self.r_cap = max(self.rmb, 1.1 * self.rh)
+
+    def omega(self, r):
+        """Angular velocity of a circular prograde orbit (BL time), per r_s/c."""
+        return 2.0 * bhp.kepler_omega(2.0 * r, self.a)
+
+
 # --- tidal disruption: spawning a star, accreting it, circularising it ------
 #
 # The black hole scene starts bare.  A star is spawned as a live,
@@ -285,7 +343,7 @@ def k_write_block(lo: ti.i32, count: ti.i32,
 @ti.kernel
 def k_swallow(lo: ti.i32, hi: ti.i32, rs: ti.f32, sustain: ti.i32,
               gm: ti.f32, feed_r: ti.f32, r_return: ti.f32,
-              jet_range: ti.f32) -> ti.i32:
+              jet_range: ti.f32, r_cap: ti.f32) -> ti.i32:
     """Handle whatever reaches the hole.
 
     Material put back is given a scale height and a little vertical motion:
@@ -325,14 +383,14 @@ def k_swallow(lo: ti.i32, hi: ti.i32, rs: ti.f32, sustain: ti.i32,
             vel[i] = ti.Vector([-vc * ti.sin(ang),
                                 (ti.random() - 0.5) * 0.06 * vc,
                                 vc * ti.cos(ang)])
-        # 2.5 r_s, not the horizon itself: anything this far inside the 3 r_s
-        # ISCO has no stable orbit left and is already committed to falling in,
-        # and capturing it out here keeps it well clear of the radius where the
-        # Paczynski-Wiita force gets steep enough that a finite timestep would
-        # slingshot it straight back out at escape speed.  Checked every
-        # substep for the same reason -- one frame of travel is enough for a
-        # fast plunging orbit to dive deep between checks.
-        if live and pos[i].norm() < 2.5 * rs:
+        # r_cap, the marginally bound orbit for this spin (Kerr.r_cap), not
+        # the horizon itself: bound gas inside it has no turning point left
+        # and is committed to falling in, and capturing it out there keeps it
+        # clear of the radius where the force gets steep enough that a finite
+        # timestep would slingshot it back out.  Checked every substep for
+        # the same reason -- one frame of travel is enough for a fast
+        # plunging orbit to dive deep between checks.
+        if live and (pos[i] - pos[0]).norm() < r_cap:
             _swallowed[0] += 1
             if sustain == 1:
                 ang = ti.random() * 6.2831853
@@ -424,39 +482,47 @@ def k_recentre(n: ti.i32):
 
 
 @ti.kernel
-def k_circularise(lo: ti.i32, hi: ti.i32, frac: ti.f32, tang: ti.f32,
-                  r_max: ti.f32, rs: ti.f32):
-    """Stand-in for the viscous dissipation a collisionless N-body cannot have.
+def k_circularise(lo: ti.i32, hi: ti.i32, dt: ti.f32, circ: ti.f32,
+                  alpha: ti.f32, gm: ti.f32, rh: ti.f32, beta: ti.f32,
+                  hr0: ti.f32, hr1: ti.f32):
+    """Stand-in for the gas physics a collisionless N-body cannot have, at the
+    rates physics sets rather than at fixed per-frame fractions.
 
-    Real tidal debris only settles into a disk because the returning stream
-    shocks against itself and radiates the energy away; with no dissipation at
-    all the stream just precesses forever into an eccentric fan.  Two separate
-    effects, because they do different jobs:
-
-      * damping the radial (and vertical) component at fixed angular momentum
-        drives an eccentric orbit onto the circular one carrying the same L --
-        this is what turns the stream into a disk;
-      * bleeding a much smaller slice off the tangential component removes L,
-        which is what makes the disk spread inward and actually drain into the
-        hole.  Without it the debris circularises into a dead static ring at
-        whatever radius its angular momentum happens to match, and the hole
-        never gets to eat.
-    """
+      * Circularisation.  Real tidal debris only settles into a disk because
+        the returning stream shocks against itself and radiates the energy
+        away.  The radial (and, lightly, vertical) velocity is damped at a
+        fraction `circ` per radian of orbit -- rate circ * Omega(r) -- at
+        fixed angular momentum, which drives an eccentric orbit onto the
+        circular one with the same L: the disk forms at the circularisation
+        radius, about 2 r_p.
+      * Viscosity.  An alpha disk (Shakura & Sunyaev 1973): nu = alpha (H/R)^2
+        r^2 Omega moves gas inward at v_r = -3 nu / 2r, i.e. a circular orbit
+        loses angular momentum at the fractional rate (3/4) alpha (H/R)^2
+        Omega.  H/R = hr0 + hr1 / r is the thickness the disk is drawn with.
+        This is what makes the disk drain into the hole, on its viscous time
+        -- not a fixed fraction per frame."""
     for i in range(lo, hi):
-        r = pos[i].norm()
+        d = pos[i] - pos[0]
+        r = d.norm()
         # |y| < 0.3 r keeps this to material that is actually in the disk --
         # jet particles climbing out along the poles must not be dragged back
         # down into the plane by it
-        if r < r_max and r > 1.5 * rs and abs(pos[i][1]) < 0.3 * r:
-            rhat = pos[i] / r
-            vr = vel[i].dot(rhat)
-            vel[i] -= rhat * (vr * frac)
+        if r > 1.05 * rh and r < 0.5 * GRAVEYARD and abs(d[1]) < 0.3 * r:
+            om = ti.sqrt(gm * ti.pow(r, beta - 1.0)
+                         / ti.pow(ti.max(r - rh, 1e-4), beta)) / r
+            dv = vel[i] - vel[0]
+            rhat = d / r
+            fc = 1.0 - ti.exp(-circ * om * dt)
+            dv -= rhat * (dv.dot(rhat) * fc)
             # only lightly: the vertical motion is what gives the disk its
             # thickness, and damping it as hard as the radial component
             # flattens the disk onto the midplane exactly
-            vel[i][1] -= vel[i][1] * (frac * 0.10)
-            v_tan = vel[i] - rhat * vel[i].dot(rhat)
-            vel[i] -= v_tan * (frac * tang)
+            dv[1] -= dv[1] * (fc * 0.10)
+            hr = hr0 + hr1 / r
+            ft = 1.0 - ti.exp(-0.75 * alpha * hr * hr * om * dt)
+            v_t = dv - rhat * dv.dot(rhat)
+            dv -= v_t * ft
+            vel[i] = vel[0] + dv
 
 
 @ti.kernel
@@ -557,16 +623,50 @@ gas_b = ti.field(ti.f32, shape=(GAS_NZ, GAS_NY, GAS_NX))
 # cost of the technique -- four times the bytes was four times the price for
 # precision a glow cannot show.  Square-rooted before quantising, so the
 # resolution is spent on the faint material where the eye can see steps.
-gas_u8 = ti.field(ti.u8, shape=(GAS_NZ, GAS_NY, GAS_NX))
+gas_u8 = ti.Vector.field(2, ti.u8, shape=(GAS_NZ, GAS_NY, GAS_NX))
 GAS_DREF = 420.0         # density that saturates the byte: a little above
                          # what the core of an intact star reaches
+# Channel 1 of the grid: the fraction of the gas in each cell that has joined
+# the disk.  A star and the stream it is drawn into keep the star's colour
+# wherever they are; only gas that has actually settled onto a disk orbit
+# takes the disk's.  Kept per particle and latched: gas that has been shocked
+# into the disk stays disk gas.
+in_disk = ti.field(ti.f32, shape=MAX_N)
+gas_s = ti.field(ti.f32, shape=(GAS_NZ, GAS_NY, GAS_NX))
+gas_t = ti.field(ti.f32, shape=(GAS_NZ, GAS_NY, GAS_NX))
 
 
 @ti.kernel
-def k_gas_quantise(src: ti.template()):
+def k_mark_disk(lo: ti.i32, hi: ti.i32, gm: ti.f32, rh: ti.f32, beta: ti.f32,
+                core: ti.types.vector(3, ti.f32), core_r2: ti.f32):
+    """Latch in_disk = 1 for particles on near-circular orbits -- the same test
+    App.update_tde builds the disk from -- except inside a star still whole."""
+    for i in range(lo, hi):
+        if in_disk[i] < 0.5:
+            d = pos[i] - pos[0]
+            r = d.norm()
+            if r > 1.05 * rh and r < 0.5 * GRAVEYARD and (pos[i] - core).norm_sqr() > core_r2:
+                dv = vel[i] - vel[0]
+                vc = ti.sqrt(gm * ti.pow(r, beta - 1.0) / ti.pow(r - rh, beta))
+                vr = ti.abs(dv.dot(d)) / r
+                kap = d.cross(dv).norm() / (r * vc)
+                if vr < 0.30 * vc and kap > 0.75 and kap < 1.3:
+                    in_disk[i] = 1.0
+
+
+@ti.kernel
+def k_fill_in_disk(lo: ti.i32, hi: ti.i32, v: ti.f32):
+    for i in range(lo, hi):
+        in_disk[i] = v
+
+
+@ti.kernel
+def k_gas_quantise(src: ti.template(), srcs: ti.template()):
     for I in ti.grouped(src):
         v = ti.sqrt(ti.min(src[I] * (1.0 / GAS_DREF), 1.0))
-        gas_u8[I] = ti.cast(v * 255.0 + 0.5, ti.u8)
+        f = ti.min(srcs[I] / ti.max(src[I], 1e-9), 1.0)
+        gas_u8[I] = ti.Vector([ti.cast(v * 255.0 + 0.5, ti.u8),
+                               ti.cast(f * 255.0 + 0.5, ti.u8)])
 
 
 @ti.kernel
@@ -580,8 +680,10 @@ def k_gas_splat(lo: ti.i32, hi: ti.i32, amp: ti.f32, rx: ti.f32, ry: ti.f32):
     splat is therefore the caller's business, through lo and hi."""
     for I in ti.grouped(gas_a):
         gas_a[I] = 0.0
+        gas_s[I] = 0.0
     for i in range(lo, hi):
         q = pos[i]
+        sh = in_disk[i]
         gx = (q[0] / rx * 0.5 + 0.5) * GAS_NX - 0.5
         gy = (q[1] / ry * 0.5 + 0.5) * GAS_NY - 0.5
         gz = (q[2] / rx * 0.5 + 0.5) * GAS_NZ - 0.5
@@ -596,6 +698,7 @@ def k_gas_splat(lo: ti.i32, hi: ti.i32, amp: ti.f32, rx: ti.f32, ry: ti.f32):
                 wy = fy if dy == 1 else 1.0 - fy
                 wz = fz if dz == 1 else 1.0 - fz
                 gas_a[iz + dz, iy + dy, ix + dx] += amp * wx * wy * wz
+                gas_s[iz + dz, iy + dy, ix + dx] += amp * wx * wy * wz * sh
 
 
 @ti.kernel
@@ -629,7 +732,10 @@ def build_gas(scene, amp):
     k_gas_blur(gas_a, gas_b, 0)
     k_gas_blur(gas_b, gas_a, 1)
     k_gas_blur(gas_a, gas_b, 2)
-    k_gas_quantise(gas_b)
+    k_gas_blur(gas_s, gas_t, 0)
+    k_gas_blur(gas_t, gas_s, 1)
+    k_gas_blur(gas_s, gas_t, 2)
+    k_gas_quantise(gas_b, gas_t)
     return gas_u8.to_numpy()
 
 
@@ -2112,7 +2218,6 @@ def preset_black_hole(rng):
         "r_peri": 17.0,      # pericentre, deep inside the tidal radius
         "soft": 0.05,
         "gm": gm,
-        "rs": rs,
     }
     return sc
 
@@ -2157,8 +2262,8 @@ def make_star(cfg, n, rng, phi=0.5 * math.pi, n_src=None):
     v -= v[:n_src_c].mean(axis=0)
 
     r0 = float(np.clip(cfg.get("r_start", r_apo), r_peri * 1.6, r_apo))
-    rs = float(cfg.get("rs", 0.0))
-    if rs > 0.0:
+    rh = float(cfg.get("rh", 0.0))
+    if rh > 0.0:
         # The hole is integrated with the Paczynski-Wiita potential,
         # Phi = -GM/(r - r_s), so the energy and angular momentum that put the
         # apsides at r_peri and r_apo are that potential's, not Newton's.
@@ -2166,12 +2271,15 @@ def make_star(cfg, n, rng, phi=0.5 * math.pi, n_src=None):
         # left the star measurably off the orbit it was advertised as being on:
         # with the defaults it reached 15.7 r_s rather than the 17 the panel
         # was computing beta against.
-        ap, pp = r_apo - rs, r_peri - rs
+        # (now the spinning hole's pseudo-Newtonian potential, see k_accel)
+        beta = float(cfg["beta"])
+        phi_a = float(bhp.abn_potential(r_apo, gm, rh, beta))
+        phi_p = float(bhp.abn_potential(r_peri, gm, rh, beta))
         denom = 1.0 / (r_peri * r_peri) - 1.0 / (r_apo * r_apo)
-        l2 = 2.0 * gm * (1.0 / pp - 1.0 / ap) / max(denom, 1e-30)
-        en = 0.5 * l2 / (r_apo * r_apo) - gm / ap
+        l2 = 2.0 * (phi_a - phi_p) / max(denom, 1e-30)
+        en = 0.5 * l2 / (r_apo * r_apo) + phi_a
         l_orb = math.sqrt(max(l2, 0.0))
-        v0 = math.sqrt(max(2.0 * (en + gm / max(r0 - rs, 1e-6)), 0.0))
+        v0 = math.sqrt(max(2.0 * (en - float(bhp.abn_potential(r0, gm, rh, beta))), 0.0))
     else:
         a_orb = 0.5 * (r_apo + r_peri)
         ecc = (r_apo - r_peri) / (r_apo + r_peri)
@@ -2567,7 +2675,14 @@ uniform float u_time;
 uniform float u_diskIn, u_diskOut;
 uniform int u_steps;
 uniform float u_diskBright;
-uniform float u_spin;        // +-1, sense of disk rotation
+uniform float u_a;           // Kerr a = a* M in r_s (M = 1/2); + turns with the disk
+uniform float u_rH;          // outer horizon, r_s
+uniform int u_blackbody;     // 1 = disk coloured as a blackbody at its temperature
+uniform float u_logTmax;     // log10 of the disk's peak temperature, K
+uniform float u_logTstar;    // log10 surface temperature of the star, K
+uniform float u_logTfloor;   // coolest disk colour shown (orange), log10 K
+uniform sampler2D u_bbLUT;   // blackbody colour (unit luminance) over log10 T
+uniform vec2 u_bbLogT;       // log10 T at the first and last texel
 uniform float u_jetBright;   // 0 = no jet
 uniform float u_jetLen;      // how far the beams reach, in r_s
 uniform float u_jetRad;      // beam radius at the base
@@ -2593,6 +2708,12 @@ vec3 gasCoord(vec3 w) {
 // Density at a point, faded to nothing across the outermost tenth of the grid.
 // Without that fade the box is visible as a straight edge ruled across the sky
 // wherever material reaches a face, which is not a thing space does.
+// fraction of the gas here that has joined the disk
+float gasDisk(vec3 gc) {
+    if (any(lessThan(gc, vec3(0.0))) || any(greaterThan(gc, vec3(1.0)))) return 0.0;
+    return texture(u_gas, gc).g;
+}
+
 float gasAt(vec3 gc) {
     if (any(lessThan(gc, vec3(0.0))) || any(greaterThan(gc, vec3(1.0)))) return 0.0;
     vec3 e = smoothstep(vec3(1.0), vec3(0.88), abs(gc * 2.0 - 1.0));
@@ -2607,7 +2728,7 @@ float gasAt(vec3 gc) {
 // and comes out blood red when it should be a warm white.  Mode 1 is a cold
 // cloud lit from within: nothing is heating it from a centre, so its colour
 // follows density alone.
-vec3 gasColor(float g, float r);
+vec3 gasColor(float g, float r, float s);
 
 // Cheap blackbody-ish ramp, t = 0 (cool outer disk) .. 1+ (inner, doppler boosted)
 vec3 diskColor(float t) {
@@ -2619,14 +2740,124 @@ vec3 diskColor(float t) {
     return c;
 }
 
-vec3 gasColor(float g, float r) {
+// The visible colour of a blackbody at 10^lt K -- Planck's law through the
+// CIE 1931 eye (bhp.blackbody_lut) -- normalised to unit luminance, so it
+// sets the hue and the brightness is left to the emission model.
+vec3 blackbodyColor(float lt) {
+    float u = clamp((lt - u_bbLogT.x) / (u_bbLogT.y - u_bbLogT.x), 0.0, 1.0);
+    return texture(u_bbLUT, vec2((u * 511.0 + 0.5) / 512.0, 0.5)).rgb;
+}
+
+vec3 gasColor(float g, float r, float s) {
     if (u_gasMode == 1) {
         vec3 c = mix(vec3(0.12, 0.16, 0.42), vec3(0.72, 0.34, 0.52),
                      smoothstep(0.02, 0.30, g));
         return mix(c, vec3(1.00, 0.90, 0.74), smoothstep(0.28, 0.75, g));
     }
+    if (u_blackbody == 1) {
+        // The star, and the stream it is drawn out into, radiate at the
+        // star's own surface temperature: tidal stretching does not heat the
+        // gas.  The fraction s of the gas here that has settled onto a disk
+        // orbit (tracked per particle) has the disk's temperature for its
+        // radius, T ~ r^-3/4.
+        float x = clamp(u_diskIn / max(r, 1.2), 0.0, 1.0);
+        float lt_disk = max(u_logTmax + 0.75 * log(x) / log(10.0) + 0.12, u_logTfloor);
+        return blackbodyColor(mix(u_logTstar, lt_disk, s));
+    }
     float t = pow(clamp(u_diskIn / max(r, 1.2), 0.02, 2.0), 0.75) + 0.92 * g;
     return diskColor(t);
+}
+
+// --- Kerr spacetime ---------------------------------------------------------
+// OUTGOING Kerr-Schild Cartesian coordinates, spin axis Z.  World (x, y, z)
+// maps to (x, z, -y), so Z is the disk's angular momentum (-y in the world)
+// and a > 0 is a hole turning with the disk.  Outgoing because rays are traced
+// BACKWARDS from the camera, and a ray traced back into the hole meets the
+// past horizon, which these coordinates -- unlike the ingoing ones -- are
+// regular across.  Checked against the exact Kerr critical impact parameters
+// (a = 0: 3 sqrt 3 M; a = 0.9: 2.844 M / 6.832 M) to 4 figures.
+//     g = eta + f k k,   f = 2 M r^3 / (r^4 + a^2 Z^2),
+//     k = (1, -(r X - a Y)/(r^2 + a^2), -(r Y + a X)/(r^2 + a^2), -Z / r)
+const float BH_M = 0.5;
+vec3 toKS(vec3 w) { return vec3(w.x, w.z, -w.y); }
+vec3 fromKS(vec3 k) { return vec3(k.x, -k.z, k.y); }
+
+float ksR(vec3 x) {
+    float a2 = u_a * u_a;
+    float w = dot(x, x) - a2;
+    return sqrt(max(0.5 * (w + sqrt(w * w + 4.0 * a2 * x.z * x.z)), 1e-12));
+}
+
+void ksMetric(vec3 x, out float f, out vec3 kv, out float r) {
+    float a = u_a, a2 = a * a;
+    float w = dot(x, x) - a2;
+    float r2 = max(0.5 * (w + sqrt(w * w + 4.0 * a2 * x.z * x.z)), 1e-12);
+    r = sqrt(r2);
+    float D = r2 + a2;
+    kv = -vec3((r * x.x - a * x.y) / D, (r * x.y + a * x.x) / D, x.z / r);
+    f = 2.0 * BH_M * r * r2 / (r2 * r2 + a2 * x.z * x.z);
+}
+
+// Hamilton's equations for the (past-directed, p_t = +1) photon momentum:
+//     H = 1/2 (|p|^2 - 1 - f (1 + l.p)^2),  l = -kv
+void geo(vec3 x, vec3 p, out vec3 dx, out vec3 dp) {
+    float a = -u_a, a2 = a * a;
+    float w = dot(x, x) - a2;
+    float S = sqrt(w * w + 4.0 * a2 * x.z * x.z);
+    float r2 = max(0.5 * (w + S), 1e-12);
+    float r = sqrt(r2);
+    float D = r2 + a2;
+    vec3 l = vec3((r * x.x + a * x.y) / D, (r * x.y - a * x.x) / D, x.z / r);
+    float den = r2 * r2 + a2 * x.z * x.z;
+    float f = 2.0 * BH_M * r * r2 / den;
+    float Lq = dot(l, p) + 1.0;
+    dx = p - f * Lq * l;
+    vec3 gr = vec3(r2 * x.x, r2 * x.y, (r2 + a2) * x.z) / (r * max(S, 1e-9));
+    vec3 gf = f * (3.0 * gr / r - (4.0 * r * r2 * gr + vec3(0.0, 0.0, 2.0 * a2 * x.z)) / den);
+    float sxy = x.x * p.x + x.y * p.y;
+    float A = r * sxy + a * (x.y * p.x - x.x * p.y);
+    vec3 gA = gr * sxy + r * vec3(p.x, p.y, 0.0) + a * vec3(-p.y, p.x, 0.0);
+    vec3 glp = gA / D - A * 2.0 * r * gr / (D * D) + vec3(0.0, 0.0, p.z) / r
+             - x.z * p.z * gr / r2;
+    dp = 0.5 * Lq * Lq * gf + f * Lq * glp;
+}
+
+float gdot4(vec4 u, vec4 v, float f, vec3 kv) {
+    float ku = u.x + dot(kv, u.yzw);
+    float kw = v.x + dot(kv, v.yzw);
+    return -u.x * v.x + dot(u.yzw, v.yzw) + f * ku * kw;
+}
+
+vec3 nullify(vec3 x, vec3 p) {
+    float f, r; vec3 kv; ksMetric(x, f, kv, r);
+    vec3 d = normalize(p);
+    float s = dot(kv, d);
+    float A = 1.0 - f * s * s, B = 2.0 * f * s, C = -(1.0 + f);
+    return d * ((-B + sqrt(max(B * B - 4.0 * A * C, 0.0))) / (2.0 * A));
+}
+
+// prograde circular orbit, Boyer-Lindquist radius rc (r_s), per r_s/c
+float keplerOmega(float rc) {
+    return sqrt(BH_M) / (pow(max(rc, 0.05), 1.5) + u_a * sqrt(BH_M));
+}
+
+// nu_obs / nu_emit for gas orbiting at om: gravitational redshift, Doppler
+// shift and frame dragging in one exact expression (E = 1, L_z conserved).
+float orbitG(vec3 x, float om, float Lz, float gCam) {
+    float f, r; vec3 kv; ksMetric(x, f, kv, r);
+    float rho2 = x.x * x.x + x.y * x.y;
+    float lphi = -u_a * rho2 / (r * r + u_a * u_a);
+    float nrm = -((-1.0 + f) + 2.0 * om * f * lphi + om * om * (rho2 + f * lphi * lphi));
+    if (nrm <= 1e-6) return 0.0;
+    return gCam * sqrt(nrm) / max(1.0 - om * Lz, 1e-4);
+}
+
+// Boyer-Lindquist cylindrical radius of a world-axes point (hole-centred, r_s)
+float blCyl(vec3 w) {
+    vec3 x = toKS(w);
+    float r = ksR(x);
+    float ct = clamp(x.z / r, -1.0, 1.0);
+    return r * sqrt(1.0 - ct * ct);
 }
 
 void main() {
@@ -2638,13 +2869,37 @@ void main() {
     vec3 p = (u_camPos - u_bhPos) / u_rs;
     vec3 v = rd;
 
-    // Null geodesics of the Schwarzschild metric in these coordinates obey
-    //     d2x/dl2 = -1.5 * h^2 * x / r^5 ,  h = |x cross v|  (conserved),
-    // with r_s = 1.  Integrated below with velocity Verlet.  h only depends on
-    // the camera ray, not on where along it we start, so it is safe to compute
-    // before the vacuum skip below moves p forward.
-    vec3 hvec = cross(p, v);
-    float h2 = dot(hvec, hvec);
+    // The photon arriving at this pixel, as seen by a static camera: build
+    // its orthonormal frame in the Kerr metric (project the axes off its
+    // 4-velocity, Gram-Schmidt), send the photon in along -n, and keep its
+    // past-directed momentum P (p_t = +1) in Kerr-Schild coordinates X.  p and
+    // v below stay the world-axes position and direction every volume is
+    // sampled with.
+    vec3 X = toKS(p);
+    vec3 P;
+    float gCam;
+    {
+        vec3 n = toKS(rd);
+        float f, r; vec3 kv; ksMetric(X, f, kv, r);
+        vec4 u = vec4(inversesqrt(max(1.0 - f, 1e-4)), 0.0, 0.0, 0.0);
+        vec4 e0 = vec4(0.0, 1.0, 0.0, 0.0);
+        e0 += gdot4(u, e0, f, kv) * u;
+        e0 *= inversesqrt(gdot4(e0, e0, f, kv));
+        vec4 e1 = vec4(0.0, 0.0, 1.0, 0.0);
+        e1 += gdot4(u, e1, f, kv) * u;
+        e1 -= gdot4(e0, e1, f, kv) * e0;
+        e1 *= inversesqrt(gdot4(e1, e1, f, kv));
+        vec4 e2 = vec4(0.0, 0.0, 0.0, 1.0);
+        e2 += gdot4(u, e2, f, kv) * u;
+        e2 -= gdot4(e0, e2, f, kv) * e0;
+        e2 -= gdot4(e1, e2, f, kv) * e1;
+        e2 *= inversesqrt(gdot4(e2, e2, f, kv));
+        vec4 k = u - (n.x * e0 + n.y * e1 + n.z * e2);
+        float lk = k.x + dot(kv, k.yzw);
+        float E = k.x - f * lk;
+        P = -(k.yzw + f * lk * kv) / E;
+        gCam = 1.0 / E;
+    }
 
     // Vacuum skip: far outside the disk, spacetime is essentially flat and the
     // ray travels in a straight line, so jump analytically to where curvature
@@ -2669,12 +2924,15 @@ void main() {
         float t = disc >= 0.0 ? (-B - sqrt(disc)) / (2.0 * A) : -1.0;
         if (t > 0.0) {
             p += v * t;          // negligible bending accumulated out here
+            X = toKS(p);
+            P = nullify(X, P);
         } else {
             steps = 0;            // path's closest approach never reaches enterR
         }
     }
 
     float r0 = length(p);
+    float Lz = X.y * P.x - X.x * P.y;    // photon's angular momentum, conserved
     // marched out past the near-field shell even when the camera is closer in,
     // so debris behind the hole is still picked up on the way out
     float escR = max(max(u_diskOut * 1.6, r0 * 1.15 + 6.0), u_nearR * 1.08);
@@ -2705,18 +2963,19 @@ void main() {
     // is stable from frame to frame rather than crawling.
     float jitter = hash12(gl_FragCoord.xy);
 
-    vec3 acc = -1.5 * h2 * p / pow(dot(p, p), 2.5);
+    vec3 dX, dP;
+    geo(X, P, dX, dP);
 
     for (int i = 0; i < steps; i++) {
-        float r = length(p);
-        if (r < 1.0) { captured = true; break; }
+        float r = ksR(X);
+        if (r < u_rH * 1.01) { captured = true; break; }
         if (r > escR && dot(p, v) > 0.0) break;
         if (trans < 0.004) break;
 
         // The cap used to be 1.3 everywhere, which is far finer than empty
         // space needs and is what made a long beam or a wide debris field run
         // the step budget out before the ray got there.
-        float dt = clamp(0.11 * (r - 0.92), 0.02, 3.5);
+        float dt = clamp(0.11 * (r - 0.92 * u_rH), 0.012, 3.5);
         // Enough to resolve the disk's scale height.  The old clamp here drove
         // the step down to 0.035 anywhere near the midplane, because a plane
         // has to be caught exactly; a slab only has to be sampled, and a few
@@ -2736,11 +2995,17 @@ void main() {
             && max(abs(gp.x), abs(gp.z)) < u_gasHalf.x) dt = min(dt, u_gasStep);
         if (i == 0) dt *= 0.25 + 0.75 * jitter;
 
+        // RK4 along the Kerr null geodesic
         vec3 pPrev = p;
-        p += v * dt + 0.5 * acc * dt * dt;
-        vec3 accNew = -1.5 * h2 * p / pow(dot(p, p), 2.5);
-        v += 0.5 * (acc + accNew) * dt;
-        acc = accNew;
+        vec3 k2x, k2p, k3x, k3p, k4x, k4p;
+        geo(X + 0.5 * dt * dX, P + 0.5 * dt * dP, k2x, k2p);
+        geo(X + 0.5 * dt * k2x, P + 0.5 * dt * k2p, k3x, k3p);
+        geo(X + dt * k3x, P + dt * k3p, k4x, k4p);
+        X += dt / 6.0 * (dX + 2.0 * k2x + 2.0 * k3x + k4x);
+        P += dt / 6.0 * (dP + 2.0 * k2p + 2.0 * k3p + k4p);
+        geo(X, P, dX, dP);
+        p = fromKS(X);
+        v = normalize(fromKS(dX));
 
         // Sampled at a per-pixel point within the step rather than always at
         // its middle.  Every volume below -- jet, disk, debris -- is sampled
@@ -2855,7 +3120,8 @@ void main() {
         // model, so only the edge-on view changes.
         {
             vec3 x = mid;
-            float rr = length(x.xz);
+            // Boyer-Lindquist radius, the one the ISCO (u_diskIn) is quoted in
+            float rr = blCyl(x);
             float hh = u_diskH * (0.32 + 0.052 * rr);
             float vprof = exp(-(x.y * x.y) / (hh * hh));
             if (rr > u_diskIn && rr < u_diskOut && vprof > 0.004) {
@@ -2877,7 +3143,8 @@ void main() {
                 float per = 45.0;
                 float ta = fract(u_time / per);
                 float tb = fract(u_time / per + 0.5);
-                float om = u_spin * 0.7071 * pow(rr, -1.5);
+                // Kerr orbital angular velocity; the disk turns -phi about +y
+                float om = -keplerOmega(rr);
                 float wa = 1.0 - abs(2.0 * ta - 1.0);
                 vec3 nz = vec3(0.0, 0.0, log(rr) * 2.2);
                 float dens = 0.0;
@@ -2891,27 +3158,36 @@ void main() {
                 dens = pow(clamp(dens * 1.7 - 0.32, 0.0, 1.0), 1.25);
                 float lanes = 0.40 + 0.60 * dens;
 
-                float radial = smoothstep(0.0, 0.10, tn) * (1.0 - smoothstep(0.45, 1.0, tn));
-                float emis = pow(u_diskIn / rr, 2.1);
+                // Novikov-Thorne: the flux of a thin disk goes as
+                // r^-3 (1 - sqrt(r_in / r)) -- zero at the ISCO, where no
+                // torque holds the gas, peaking at (49/36) r_in, then falling
+                // as r^-3.  Normalised to 1 at that peak.  Faded out over the
+                // outer half so the disk's edge is gas thinning, not a cut.
+                float xi = u_diskIn / rr;
+                float emis = xi * xi * xi * max(1.0 - sqrt(xi), 0.0) / 0.05665;
+                float radial = 1.0 - smoothstep(0.45, 1.0, tn);
 
-                // Orbital velocity of the emitting gas (c = 1, r_s = 1 -> GM
-                // = 1/2).  The speed a local static observer measures for a
-                // circular geodesic is sqrt(M/(r - 2M)) = sqrt(0.5/(r - 1)),
-                // not the Newtonian sqrt(0.5/r): at the ISCO that is 0.5c
-                // against 0.41c, and it is this speed -- not the coordinate
-                // one -- that the Doppler factor below is a function of.
-                vec3 vel = normalize(cross(vec3(0.0, 1.0, 0.0), x)) * u_spin
-                         * sqrt(0.5 / max(rr - 1.0, 0.12));
-                vec3 nobs = -normalize(v);
-                float b2 = clamp(dot(vel, vel), 0.0, 0.98);
-                float gam = inversesqrt(1.0 - b2);
-                float dop = 1.0 / max(gam * (1.0 - dot(vel, nobs)), 0.05);
-                float grav = sqrt(max(1.0 - 1.0 / rr, 0.02));
-                float shift = clamp(dop * grav, 0.05, 3.2);
+                // Exact Kerr redshift of gas on a circular orbit here:
+                // Doppler, gravitational redshift and frame dragging together
+                // (this used to be the Schwarzschild special case).
+                float shift = clamp(orbitG(toKS(x), keplerOmega(rr), Lz, gCam), 0.05, 3.2);
 
                 float boost = shift * shift * shift;
-                float temp = pow(u_diskIn / rr, 0.75) * shift;
-                vec3 emit = diskColor(temp) * emis * lanes * radial * boost * u_diskBright;
+                vec3 dcol;
+                if (u_blackbody == 1) {
+                    // Blackbody.  The local temperature follows the flux,
+                    // sigma T^4 ~ emis (the Novikov-Thorne profile, 1 at its
+                    // peak), so T = T_max emis^(1/4); what reaches the camera
+                    // is a blackbody at g T (I_nu / nu^3 is invariant), so the
+                    // approaching side is bluer as well as brighter.
+                    float lt = max(u_logTmax + 0.25 * log(max(emis, 1e-8)) / log(10.0),
+                                   u_logTfloor)
+                             + log(shift) / log(10.0);
+                    dcol = blackbodyColor(lt);
+                } else {
+                    dcol = diskColor(pow(u_diskIn / rr, 0.75) * shift);
+                }
+                vec3 emit = dcol * emis * lanes * radial * boost * u_diskBright;
 
                 float seg = vprof * dt / (1.772 * hh);
                 col += trans * emit * seg;
@@ -2943,7 +3219,8 @@ void main() {
                     // near-vacuum then accumulates as much light as one
                     // crossing the disk, and the whole frame fogs over.
                     float rho = g * g;
-                    col += trans * gasColor(g, length(mid - u_gasOff))
+                    col += trans * gasColor(g, length(mid - u_gasOff),
+                                            gasDisk(gasCoord(mid)))
                                  * rho * u_gasBright * dt;
                     trans *= exp(-u_gasOpacity * rho * dt);
                 }
@@ -3182,7 +3459,22 @@ class Renderer:
         self.disk_bright = 2.1
         self.particle_gain = 1.0
         self.steps = ARGS.steps
-        self.spin = -1.0          # matches the sense the N-body disk orbits in
+        self.bh_spin = 0.9        # the hole's a*, set from Sim.spin every frame
+        self.blackbody = True     # disk colour from its real temperature
+        # Show the disk with its peak temperature at DISK_TPEAK_SHOWN instead
+        # of the real ~10^7 K.  The profile (T ~ r^-3/4 with the zero-torque
+        # inner edge) and the Doppler/gravitational shifts are unchanged, so
+        # the colour runs white -> yellow -> red outward exactly as a real
+        # blackbody disk does when its inner edge is that hot -- as around a
+        # supermassive hole.  At 10^7 K every ring is the same blue-white.
+        self.disk_tscaled = True
+        self.log_tmax = 7.0       # log10 peak disk temperature, set every frame
+        self.log_tstar = math.log10(5772.0)   # the star's surface, set every frame
+
+        self.bb_tex = ctx.texture((bhp.BB_N, 1), 4, bhp.blackbody_lut().tobytes(),
+                                  dtype="f4")
+        self.bb_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.bb_tex.repeat_x = self.bb_tex.repeat_y = False
         self.jet_bright = 0.0     # volumetric polar jets, driven by the App
         self.jet_len = 70.0
         self.jet_rad = 2.40       # collimated: the beam barely opens out
@@ -3215,7 +3507,7 @@ class Renderer:
 
         # The debris density field.  A byte per cell, sampled as a float: see
         # the gas section up top for why it is quantised.
-        self.gas_tex = ctx.texture3d((GAS_NX, GAS_NY, GAS_NZ), 1, dtype="f1")
+        self.gas_tex = ctx.texture3d((GAS_NX, GAS_NY, GAS_NZ), 2, dtype="f1")
         self.gas_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.gas_tex.repeat_x = False
         self.gas_tex.repeat_y = False
@@ -3303,7 +3595,7 @@ class Renderer:
         self.gas_tex.write(arr.tobytes())
 
     def clear_gas(self):
-        self.gas_tex.write(bytes(GAS_NX * GAS_NY * GAS_NZ))
+        self.gas_tex.write(bytes(GAS_NX * GAS_NY * GAS_NZ * 2))
 
     def upload_scene(self, scene):
         self.attr_vbo.write(scene.attrib.tobytes())
@@ -3474,7 +3766,15 @@ class Renderer:
             setu(g, "u_diskOut", scene.disk_out)
             setu(g, "u_steps", self.steps)
             setu(g, "u_diskBright", self.disk_bright)
-            setu(g, "u_spin", self.spin)
+            setu(g, "u_a", 0.5 * self.bh_spin)
+            setu(g, "u_rH", 0.5 * bhp.horizon(self.bh_spin))
+            self.bb_tex.use(5)
+            setu(g, "u_bbLUT", 5)
+            setu(g, "u_bbLogT", (bhp.BB_LOGT_MIN, bhp.BB_LOGT_MAX))
+            setu(g, "u_blackbody", 1 if self.blackbody else 0)
+            setu(g, "u_logTmax", self.log_tmax)
+            setu(g, "u_logTstar", self.log_tstar)
+            setu(g, "u_logTfloor", math.log10(DISK_TMIN_SHOWN) if self.disk_tscaled else 0.0)
             setu(g, "u_jetBright", self.jet_bright)
             setu(g, "u_jetLen", self.jet_len)
             setu(g, "u_jetRad", self.jet_rad)
@@ -3576,17 +3876,33 @@ class Sim:
         self.epoch_is_now = ARGS_EPOCH_IS_NOW
         # tidal-disruption controls
         self.self_gravity = True
-        self.viscosity = 0.0025     # circularisation rate, 1 / time unit -- low
-                                    # enough that the debris stream stays a
-                                    # visible stream for a good while before it
-                                    # settles into the disk
-        self.inflow = 0.055         # fraction of that which removes L: sets how
-                                    # fast material spirals in. With sustain on this
-                                    # is throughput, not loss -- what reaches the
-                                    # hole is resupplied, so the disk is a steady
-                                    # state rather than a dwindling one.
-        self.visc_radius = 42.0     # only inside here, where the stream piles up
-        self.sustain_disk = True    # resupply accreted material, so the disk persists
+        # The hole's spin, J c / (G M^2).  + turns with the disk.  Sets the
+        # horizon, ISCO, capture radius, the force the debris feels, the
+        # light bending, and (no spin, no jet) the jets.
+        self.spin = 0.9
+        self.kerr = Kerr(self.spin)
+        self.circ = 0.08            # circularisation: fraction of the stream's
+                                    # radial motion its self-intersection shocks
+                                    # remove per radian of orbit
+        self.alpha = 0.1            # Shakura-Sunyaev viscosity; 0.01-0.3 from MRI
+                                    # simulations and dwarf-nova outbursts.  Sets
+                                    # how long the disk lasts: t_visc =
+                                    # 1 / (alpha (H/R)^2 Omega)
+        self.disk_h = 1.0           # kept in step with Renderer.disk_h (drawing only)
+        # The disk's PHYSICAL state, measured from the debris every survey
+        # (App.update_tde): its accretion rate, the thickness that rate gives
+        # it, and the temperature of its hottest ring.  The viscosity runs on
+        # this thickness, not on the drawn one -- how fast a disk drains goes
+        # as (H/R)^2, and H/R is set by how hard it is being fed.
+        self.hr_visc = bhp.ADVECTIVE_HR
+        self.mdot = 0.0             # kg/s
+        self.mdot_edd = 0.0         # in units of the Eddington rate
+        self.t_max = 0.0            # K, peak effective temperature
+        self.t_star = 5772.0        # K, surface of the star most recently dropped
+        # Nothing is resupplied.  This used to re-inject everything the hole
+        # swallowed back at a "feed radius", so the disk never emptied; a real
+        # disk made from one star lasts exactly as long as that star's gas.
+        self.sustain_disk = False
         self.feed_radius = 26.0     # where a sustained disk is resupplied
         self.return_radius = 210.0  # past here, scattered material is brought back
         self.star_intact = False    # self-gravity only matters while a star is whole
@@ -3606,6 +3922,16 @@ class Sim:
         self.jet_speed = 0.95
         self.jet_spread = 0.032     # opening angle as a fraction of jet speed
         self.circularising = False  # switched on once the star reaches pericentre
+
+    def set_spin(self, a):
+        self.spin = bhp.clamp_spin(a)
+        self.kerr = Kerr(self.spin)
+
+    def hole_force(self):
+        """(r_H, beta) of the spinning hole's force, or (0, 0) with no hole."""
+        if self.scene is None or self.scene.pw_rs <= 0.0:
+            return 0.0, 0.0
+        return self.kerr.rh * self.scene.pw_rs, self.kerr.beta
 
     def load(self, key):
         self.key = key
@@ -3628,7 +3954,7 @@ class Sim:
                                 s.sat_radius, s.sat_rate, s.sat_phase0)
             k_update_satellites(s.n_dynamic, s.n_sat, 0.0)
         lo, hi = self.src_bounds()
-        k_accel(s.n_dynamic, lo, hi, s.gconst, s.pw_rs)
+        k_accel(s.n_dynamic, lo, hi, s.gconst, *self.hole_force())
         self.time = 0.0
         # Re-anchor the wall clock too: a scene rebuilt at a new date must not
         # inherit a stopwatch that has been running since the last one.
@@ -3697,9 +4023,12 @@ class Sim:
             return False
         slot = s.star_spawned % s.star_slots
         lo = 1 + slot * s.star_n
+        # the orbit is solved in the potential of the hole at its current spin
+        s.star_cfg["rh"], s.star_cfg["beta"] = self.hole_force()
         p, v, m, soft = make_star(s.star_cfg, s.star_n, self.rng, azimuth,
                                   n_src=s.star_src)
         k_write_block(lo, s.star_n, p, v, m, soft)
+        k_fill_in_disk(lo, lo + s.star_n, 0.0)   # a fresh star is star, not disk
         s.star_spawned += 1
         # grow the live range to cover every slot used so far; every dynamic
         # particle here is also a gravity source, so the star holds itself
@@ -3709,6 +4038,7 @@ class Sim:
         s.n_base = s.n_dynamic + s.n_sat
         self.star_intact = True
         s.star_lo = lo
+        self.t_star = main_sequence_teff(s.star_cfg["m_star"] * SIM_MASS_TO_SOLAR)
         # Stretch the density grid out to wherever this star is coming from.
         # Left at its default the star would spend its whole infall outside
         # the grid and simply not be drawn, and the grid's own edge would show
@@ -3724,7 +4054,7 @@ class Sim:
         k_balance_momentum(s.n_dynamic)
         src_lo, src_hi = self.src_bounds()
         s.n_src = src_hi - src_lo + 1
-        k_accel(s.n_dynamic, src_lo, src_hi, s.gconst, s.pw_rs)
+        k_accel(s.n_dynamic, src_lo, src_hi, s.gconst, *self.hole_force())
         return True
 
     def step(self):
@@ -3746,17 +4076,28 @@ class Sim:
         src_lo, src_hi = self.src_bounds()
         s.n_src = src_hi - src_lo + (1 if s.pw_rs > 0.0 else 0)
         eating = bool(s.star_n) and s.n_dynamic > 1
-        for _ in range(s.substeps):
+        nsub = s.substeps
+        if eating:
+            # Enough substeps to resolve an orbit at the ISCO: prograde spin
+            # brings it in to 0.62 r_s, where an orbit takes a sixth of the
+            # time it does at 3 r_s.
+            t_isco = 2.0 * math.pi / self.kerr.omega(self.kerr.isco)
+            frame = dt * nsub
+            nsub = min(max(nsub, int(math.ceil(frame / (t_isco / 80.0)))), 48)
+            dt = frame / nsub
+        rh, beta = self.hole_force()
+        for _ in range(nsub):
             k_kick(s.n_dynamic, 0.5 * dt)
             k_drift(s.n_dynamic, dt)
-            k_accel(s.n_dynamic, src_lo, src_hi, s.gconst, s.pw_rs)
+            k_accel(s.n_dynamic, src_lo, src_hi, s.gconst, rh, beta)
             k_kick(s.n_dynamic, 0.5 * dt)
             self.time += dt
             if eating:
                 s.accreted += k_swallow(1, s.n_dynamic, s.pw_rs,
                                         1 if self.sustain_disk else 0,
                                         s.gconst * s.mass[0], self.feed_radius,
-                                        self.return_radius, self.jet_range)
+                                        self.return_radius, self.jet_range,
+                                        self.kerr.r_cap * s.pw_rs)
         if s.n_sat > 0:
             k_update_satellites(s.n_dynamic, s.n_sat, self.time)
         if eating:
@@ -3769,13 +4110,15 @@ class Sim:
             # velocity would have been anyway.
             k_balance_momentum(s.n_dynamic)
             k_recentre(s.n_dynamic)
-            if self.viscosity > 0.0 and self.circularising:
-                frac = 1.0 - math.exp(-self.viscosity * dt * s.substeps)
-                k_circularise(1, s.n_dynamic, frac, self.inflow,
-                              self.visc_radius, s.pw_rs)
-            if self.jet and self.circularising:
-                k_jet(1, s.n_dynamic, self.jet_rate, self.jet_source,
-                      self.jet_speed, self.jet_spread, self.jet_base, s.pw_rs)
+            if self.circularising:
+                # H/R of the physical disk (see hr_visc)
+                k_circularise(1, s.n_dynamic, dt * nsub, self.circ, self.alpha,
+                              s.gconst * s.mass[0], rh, beta,
+                              self.hr_visc, 0.0)
+            # (The jets are drawn by the ray marcher.  Disk particles are no
+            # longer teleported onto the axis to fake them: a jet carries a
+            # negligible fraction of the accreted mass, and with nothing
+            # resupplied every particle launched was a hole in the disk.)
         if s.recycle is not None:
             lo, hi = s.recycle
             k_recycle(lo, hi, s.gconst * s.mass[0], s.pw_rs,
@@ -3847,6 +4190,7 @@ class App:
         self.star_core = np.zeros(3, dtype=np.float32)
         self.tde_tick = 0         # phase of the every-fourth-frame debris survey
         self.tgt_disk = (0.0, 3.0, 26.0)   # held between those surveys
+        self.disk_cnt_peak = 1    # most debris ever on disk orbits this meal
         self.gas_amp = 1.0        # how much material one particle stands for
         self.debris_inner = 0.0
         self.debris_outer = 0.0
@@ -3861,17 +4205,27 @@ class App:
         self.debris_inner = self.debris_outer = self.debris_frac = 0.0
         self.star_glow = self.star_bound = 0.0
         self.tgt_disk = (0.0, self.scene.disk_in, self.scene.disk_out)
+        self.disk_cnt_peak = 1
         self.renderer.clear_gas()
         if self.scene.star_n:
             # a bare hole: nothing to light up until a star has been torn apart
             self.renderer.disk_bright = 0.0
             self.renderer.jet_bright = 0.0
-            self.scene.disk_in, self.scene.disk_out = 3.0, 26.0
+            self.scene.disk_in = self.sim.kerr.isco * self.scene.pw_rs
+            self.scene.disk_out = self.scene.disk_in + 1.0
         return self.scene
 
     def update_gas(self):
         """Re-splat the debris into the density grid the renderer marches."""
         s, r = self.scene, self.renderer
+        if s.star_n and s.n_dynamic > 1 and self.sim.circularising:
+            rh, beta = self.sim.hole_force()
+            if self.sim.star_intact:
+                core = tuple(float(c) for c in self.star_core)
+                core_r2 = (1.5 * s.star_cfg["r_star"]) ** 2
+            else:
+                core, core_r2 = (GRAVEYARD, GRAVEYARD, GRAVEYARD), 0.0
+            k_mark_disk(1, s.n_dynamic, s.gconst * s.mass[0], rh, beta, core, core_r2)
         if not (s.gas == "volume" and r.gas_on) or s.n_dynamic <= s.gas_lo:
             return
         r.upload_gas(build_gas(s, self.gas_amp))
@@ -3949,35 +4303,50 @@ class App:
                 p_alive = sub[alive]
                 rhat = p_alive / r_alive[:, None]
                 v_r = np.abs(np.sum(vel_all * rhat, axis=1))
-                v_c = np.sqrt(0.5 * r_alive) / np.maximum(r_alive - s.pw_rs, 1e-3)
+                rh_w, beta_w = sim.hole_force()
+                v_c = bhp.abn_vcirc(np.maximum(r_alive, 1.01 * rh_w),
+                                    s.gconst * s.mass[0], rh_w, beta_w)
                 l_mag = np.linalg.norm(np.cross(p_alive, vel_all), axis=1)
                 kappa = l_mag / np.maximum(r_alive * v_c, 1e-9)
-                disky = ((r_alive < 60.0) & (v_r < 0.30 * v_c)
-                         & (kappa > 0.75) & (kappa < 1.3))
+                # no radius cap: the disk is wherever the circularised gas is
+                disky = (v_r < 0.30 * v_c) & (kappa > 0.75) & (kappa < 1.3)
+                if sim.star_intact:
+                    # a star still whole on its way through pericentre is
+                    # momentarily on a near-circular arc, but it is a star
+                    disky &= (np.linalg.norm(p_alive - self.star_core, axis=1)
+                              > 1.5 * s.star_cfg["r_star"])
                 cnt = int(disky.sum())
                 self.debris_frac = cnt / float(n_alive)
 
                 self.tgt_disk = (0.0, s.disk_in, s.disk_out)
                 if cnt > 60:
                     rr = r_alive[disky]
-                    # 70th percentile, not 90th: a long-lived disk always has some
-                    # scattered material way out past the body of it, and letting
-                    # that set the outer edge inflates the drawn disk until it
-                    # swallows the frame and flattens the temperature gradient
                     self.debris_inner = float(np.percentile(rr, 8))
-                    self.debris_outer = float(np.percentile(rr, 70))
-                    # Pinned near the ISCO rather than following the debris.
-                    # Inside the ISCO material plunges in a few orbits, so the
-                    # particles there are always sparse -- but a real disk still
-                    # radiates right down to it, and letting the drawn inner edge
-                    # drift out to where the particles thin out leaves an obvious
-                    # empty ring around the hole.
-                    tgt_in = 3.2
-                    self.tgt_disk = (self.disk_peak * min(1.0, self.debris_frac / 0.35),
+                    # Outer edge: where the gas on circular orbits actually is.
+                    # Only gas on near-circular orbits counts (the test above),
+                    # so scattered eccentric material cannot inflate it; the
+                    # 95th percentile drops the last few stragglers.  It starts
+                    # near the circularisation radius, ~2 r_p, and moves as
+                    # viscosity spreads the ring.
+                    self.debris_outer = float(np.percentile(rr, 95))
+                    # Inner edge: the ISCO of the hole's spin.  A thin disk
+                    # radiates down to it and no further -- inside it gas
+                    # plunges -- whatever the sparse particles there suggest.
+                    tgt_in = sim.kerr.isco * s.pw_rs
+                    # Brightness follows how much gas is left.  A disk's
+                    # luminosity is its accretion rate, Mdot ~ M_disk / t_visc,
+                    # so it fades as the ring drains -- rather than following
+                    # the FRACTION of debris on disk orbits, which stays near 1
+                    # as the last of it goes and kept the disk blazing.
+                    self.disk_cnt_peak = max(self.disk_cnt_peak, cnt)
+                    self.disk_physics(sim, s, rr, cnt * step)
+                    self.tgt_disk = (self.disk_peak * cnt / self.disk_cnt_peak,
                                      tgt_in,
-                                     min(max(self.debris_outer, tgt_in + 3.0), 36.0))
+                                     max(self.debris_outer, tgt_in + 1.0))
 
         tgt_bright, tgt_in, tgt_out = self.tgt_disk
+        if tgt_bright <= 0.0:
+            sim.mdot = sim.mdot_edd = sim.t_max = 0.0
         if self.auto_disk:
             # ease toward the target so the disk grows in smoothly instead of
             # snapping around as debris sloshes through pericentre
@@ -3999,7 +4368,13 @@ class App:
         disk_now = tgt_bright if self.auto_disk else r.disk_bright
         tgt_jet = 0.0
         if sim.jet and sim.circularising and self.disk_peak > 1e-6:
-            tgt_jet = self.jet_peak * min(1.0, max(0.0, disk_now) / self.disk_peak)
+            # Blandford-Znajek: the jet is the hole's spin energy extracted by
+            # the field the disk brings in, power ~ Omega_H^2 -- so it scales
+            # with spin (relative to a = 0.9, where it has its old brightness)
+            # and there is no jet at all from a hole that does not spin.
+            bz = bhp.bz_efficiency(sim.spin, 30.0) / bhp.bz_efficiency(0.9, 30.0)
+            tgt_jet = (self.jet_peak * min(bz, 3.0)
+                       * min(1.0, max(0.0, disk_now) / self.disk_peak))
         r.jet_bright += (tgt_jet - r.jet_bright) * 0.02
 
         self.star_glow += (self.star_bound - self.star_glow) * 0.02
@@ -4015,9 +4390,21 @@ class App:
         t = np.clip((rad - 3.0) * (1.0 / 34.0), 0.0, 1.0)
         boost = 0.85 + 1.10 * (1.0 - t) ** 2
         col = np.empty((rad.size, 3), dtype=np.float32)
-        col[:, 0] = boost                             # 1.00 hot and cool alike
-        col[:, 1] = (0.88 - 0.18 * t) * boost
-        col[:, 2] = (0.74 - 0.32 * t) * boost
+        if r.blackbody:
+            # the star's own blackbody until the gas is shocked in the disk,
+            # the disk's temperature for its radius after (as the gas pass)
+            lt_star = math.log10(sim.t_star)
+            x = np.clip(s.disk_in / np.maximum(rad, 1.2), 1e-6, 1.0)
+            lt_disk = r.log_tmax + 0.75 * np.log10(x) + 0.12
+            if r.disk_tscaled:
+                lt_disk = np.maximum(lt_disk, math.log10(DISK_TMIN_SHOWN))
+            w = in_disk.to_numpy()[1:s.n_dynamic]
+            lt = lt_star + (lt_disk - lt_star) * w
+            col[:] = bhp.blackbody_rgb(10.0 ** lt) * boost[:, None]
+        else:
+            col[:, 0] = boost                             # 1.00 hot and cool alike
+            col[:, 1] = (0.88 - 0.18 * t) * boost
+            col[:, 2] = (0.74 - 0.32 * t) * boost
         # anything well off the disk plane is in a jet: give the beams their own
         # hot blue-white so they separate from the disk instead of reading as
         # stray debris
@@ -4051,6 +4438,42 @@ class App:
         s.attrib[1:s.n_dynamic, 0:3] = col
         s.attrib[1:s.n_dynamic, 3] = size
         r.update_attrib(s, 1, s.n_dynamic)
+
+    def disk_physics(self, sim, s, rr, n_disk):
+        """Accretion rate, thickness and temperature of the disk the debris
+        has formed, from how much gas is in it and where.
+
+          Mdot  ~ M_disk / t_visc,  t_visc = 1 / (alpha (H/R)^2 Omega) at the
+                  disk's median radius
+          H/R   from that rate's Eddington ratio (bhp.scale_height): thin when
+                  fed gently, radiation-pressure puffed up to ~0.5 when fed at
+                  many times Eddington -- which a disrupted star always is
+          T     peak of the Novikov-Thorne profile, sigma T^4 =
+                  3 G M Mdot / (8 pi r^3) (1 - sqrt(r_in / r)) at r = 49/36 r_in,
+                  capped at the Eddington flux the surface can radiate
+
+        Iterated a few times because the rate and the thickness each set the
+        other; it converges in two or three."""
+        kr = sim.kerr
+        cfg = s.star_cfg
+        m_rep = cfg["m_star"] * SIM_MASS_TO_SOLAR * bhp.M_SUN_KG / max(s.star_n, 1)
+        m_disk = n_disk * m_rep
+        t_unit = BH_RS_KM * 1000.0 / bhp.C_SI              # s per r_s / c
+        r_med = float(np.median(rr)) / s.pw_rs              # r_s
+        om = kr.omega(max(r_med, kr.isco)) / t_unit          # 1/s
+        m_bh = BH_SOLAR_MASSES * bhp.M_SUN_KG
+        mdot_edd_kg = bhp.eddington_luminosity(BH_SOLAR_MASSES) / (kr.eta * bhp.C_SI ** 2)
+        hr = sim.hr_visc
+        for _ in range(4):
+            mdot = m_disk * sim.alpha * hr * hr * om
+            hr = float(bhp.scale_height(2.0 * r_med, kr.a, mdot / mdot_edd_kg, kr.eta))
+        sim.hr_visc, sim.mdot, sim.mdot_edd = hr, mdot, mdot / mdot_edd_kg
+        rs_m = BH_RS_KM * 1000.0
+        r_pk = (49.0 / 36.0) * kr.isco * rs_m
+        f_nt = (3.0 * bhp.G_SI * m_bh * mdot / (8.0 * math.pi * r_pk ** 3)
+                * (1.0 - math.sqrt(36.0 / 49.0)))
+        f_cap = float(bhp.eddington_flux(r_pk, m_bh, hr))
+        sim.t_max = (min(f_nt, f_cap) / bhp.SIGMA_SB) ** 0.25
 
     def spawn_star(self):
         """Drop the star on the far side of the hole from the camera, nudged off
@@ -4407,23 +4830,65 @@ def draw_gui(app):
         changed, val = imgui.slider_float("disk brightness", r.disk_bright, 0.0, 6.0, "%.2f")
         if changed:
             r.disk_bright = val
-        changed, val = imgui.slider_float("disk inner", scene.disk_in, 1.2, 12.0, "%.2f r_s")
-        if changed:
-            scene.disk_in = min(val, scene.disk_out - 1.0)
-        changed, val = imgui.slider_float("disk outer", scene.disk_out, 6.0, 70.0, "%.1f r_s")
-        if changed:
-            scene.disk_out = max(val, scene.disk_in + 1.0)
         changed, val = imgui.slider_float("disk thickness", r.disk_h, 0.25, 3.0, "%.2f")
         if changed:
             r.disk_h = val
-        changed, val = imgui.checkbox("flip disk spin", r.spin > 0.0)
+            sim.disk_h = val
+        changed, val = imgui.checkbox("blackbody colour", r.blackbody)
         if changed:
-            r.spin = 1.0 if val else -1.0
+            r.blackbody = val
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Colour the disk as a blackbody at its real temperature, "
+                              "Doppler and gravitationally shifted.  Off: the old "
+                              "artistic orange palette.  A disk this hot (~10^7 K) is "
+                              "blue-white -- the visible colour of a blackbody stops "
+                              "changing above ~10^5 K.")
+        imgui.begin_disabled(not r.blackbody)
+        changed, val = imgui.checkbox("peak shown at 6500 K", r.disk_tscaled)
+        if changed:
+            r.disk_tscaled = val
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Keep the disk's real temperature profile (T ~ r^-3/4) and "
+                              "Doppler shifts, but show its hottest ring at 6500 K: white "
+                              "inside, yellow, then red further out -- the colours a real "
+                              "disk has when it is that hot, as around a supermassive "
+                              "hole.  Off: the true ~10^7 K of this 10 M_sun hole, which "
+                              "is blue-white everywhere.")
+        imgui.end_disabled()
+        changed, val = imgui.slider_float("spin  a*", sim.spin, -bhp.SPIN_MAX, bhp.SPIN_MAX,
+                                          "%+.3f")
+        if changed:
+            sim.set_spin(val)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("J c / (G M^2).  + : the hole turns the same way as the "
+                              "disk, - : against it.  0.998 is the most a disk can spin "
+                              "a hole up to (Thorne 1974).  Moves the ISCO -- and so the "
+                              "disk's inner edge -- from 4.5 r_s (retrograde) through "
+                              "3 r_s (none) to 0.62 r_s (prograde).")
+        kr = sim.kerr
         imgui.separator_text("geometry")
         imgui.text(f"mass         {BH_SOLAR_MASSES:.0f} M_sun")
-        imgui.text(f"horizon      1.00 r_s  ({BH_RS_KM:6.1f} km)")
-        imgui.text(f"photon ring  1.50 r_s  ({1.5 * BH_RS_KM:6.1f} km)")
-        imgui.text(f"ISCO         3.00 r_s  ({3.0 * BH_RS_KM:6.1f} km)")
+        imgui.text(f"horizon      {kr.rh:4.2f} r_s  ({kr.rh * BH_RS_KM:6.1f} km)")
+        imgui.text(f"photon orbit {kr.ph_co:4.2f} / {kr.ph_counter:4.2f} r_s (co / counter)")
+        imgui.text(f"ISCO         {kr.isco:4.2f} r_s  ({kr.isco * BH_RS_KM:6.1f} km)")
+        imgui.text(f"efficiency   {100.0 * kr.eta:4.1f} % of rest mass radiated")
+        imgui.separator_text("disk (from the debris)")
+        if r.disk_bright > 0.01:
+            imgui.text(f"inner edge   {scene.disk_in:5.2f} r_s  (ISCO)")
+            imgui.text(f"outer edge   {scene.disk_out:5.1f} r_s  (where the gas is)")
+            imgui.text(f"accretion    {sim.mdot / bhp.M_SUN_KG:8.2e} M_sun/s"
+                       f" = {sim.mdot_edd:7.1e} x Eddington")
+            imgui.text(f"H/R          {sim.hr_visc:5.3f}  (from that rate)")
+            imgui.text(f"T_max        {sim.t_max:8.2e} K")
+            r_o = max(scene.disk_out, kr.isco)
+            t_visc = 1.0 / max(sim.alpha * sim.hr_visc ** 2 * kr.omega(r_o), 1e-30)
+            t_s = t_visc * BH_RS_KM / 299792.458
+            imgui.text(f"drains in    ~{t_visc:7.0f} time units ({t_s * 1e3:.0f} ms)")
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Viscous time at the outer edge, 1/(alpha (H/R)^2 Omega), "
+                                  "with the H/R the accretion rate gives the disk.")
+        else:
+            imgui.text("no disk")
         imgui.text(f"camera       {cam.dist / max(scene.world_rs, 1e-6):8.2f} r_s")
         imgui.pop_item_width()
         imgui.end()
@@ -4468,6 +4933,8 @@ def draw_gui(app):
                    * (0.5 / cfg["m_star"]) ** (1.0 / 3.0))
             beta = r_t / max(cfg["r_peri"], 1e-6)
             verdict = "full disruption" if beta >= 1.0 else "survives the pass"
+            if cfg["r_peri"] < sim.kerr.rmb:
+                verdict = "swallowed whole"
             col = imgui.ImVec4(0.5, 1.0, 0.6, 1.0) if beta >= 1.0 else imgui.ImVec4(1.0, 0.8, 0.4, 1.0)
             imgui.text(f"tidal radius {r_t:6.1f} r_s")
             imgui.text_colored(col, f"beta = r_t/r_p = {beta:4.2f}  {verdict}")
@@ -4476,31 +4943,30 @@ def draw_gui(app):
             # the picture imply otherwise.  See the preset's docstring.
             r_km = cfg["r_star"] * BH_RS_KM
             imgui.text(f"star radius {r_km:8.0f} km = {r_km / 696340.0:.4f} R_sun")
+            t_eff = main_sequence_teff(cfg["m_star"] * SIM_MASS_TO_SOLAR)
+            kind = ("M" if t_eff < 3900 else "K" if t_eff < 5300 else "G" if t_eff < 6000
+                    else "F" if t_eff < 7500 else "A" if t_eff < 10000 else "B")
+            imgui.text(f"surface T   {t_eff:8.0f} K  ({kind}-type main sequence)")
             imgui.text_colored(imgui.ImVec4(0.65, 0.7, 0.8, 1.0),
                                "(compact for its mass, so the disruption")
             imgui.text_colored(imgui.ImVec4(0.65, 0.7, 0.8, 1.0),
                                " happens where the lensing is visible)")
 
         imgui.separator_text("debris")
-        changed, val = imgui.checkbox("sustain disk (companion feed)", sim.sustain_disk)
-        if changed:
-            sim.sustain_disk = val
-        if sim.sustain_disk:
-            changed, val = imgui.slider_float("feed radius", sim.feed_radius, 8.0, 45.0, "%.1f r_s")
-            if changed:
-                sim.feed_radius = val
         changed, val = imgui.checkbox("self-gravity", sim.self_gravity)
         if changed:
             sim.self_gravity = val
         changed, val = imgui.checkbox("disk grows from debris", app.auto_disk)
         if changed:
             app.auto_disk = val
-        changed, val = imgui.slider_float("viscosity", sim.viscosity, 0.0, 0.03, "%.4f")
+        changed, val = imgui.slider_float("circularisation", sim.circ, 0.01, 1.0, "%.3f",
+                                          imgui.SliderFlags_.logarithmic)
         if changed:
-            sim.viscosity = val
-        changed, val = imgui.slider_float("accretion rate", sim.inflow, 0.0, 0.10, "%.3f")
+            sim.circ = val
+        changed, val = imgui.slider_float("viscosity alpha", sim.alpha, 0.01, 0.3, "%.3f",
+                                          imgui.SliderFlags_.logarithmic)
         if changed:
-            sim.inflow = val
+            sim.alpha = val
         imgui.separator_text("polar jets")
         changed, val = imgui.checkbox("twin jets", sim.jet)
         if changed:
@@ -4519,9 +4985,6 @@ def draw_gui(app):
         changed, val = imgui.slider_float("jet twist", app.renderer.jet_twist, 0.0, 1.0, "%.2f")
         if changed:
             app.renderer.jet_twist = val
-        changed, val = imgui.slider_float("beam spread", sim.jet_spread, 0.0, 0.20, "%.3f")
-        if changed:
-            sim.jet_spread = val
         imgui.end_disabled()
         imgui.text(f"stars dropped  {scene.star_spawned:6d}")
         imgui.text(f"{'recycled' if sim.sustain_disk else 'accreted':<14s} {scene.accreted:6d}")
@@ -4818,6 +5281,13 @@ def main():
         else:
             vcount = scene.n_base
         _reset_scissor()
+        renderer.bh_spin = app.sim.spin
+        if renderer.disk_tscaled:
+            renderer.log_tmax = math.log10(DISK_TPEAK_SHOWN)
+        elif app.sim.t_max > 0.0:
+            renderer.log_tmax = math.log10(app.sim.t_max)
+        renderer.log_tstar = math.log10(app.sim.t_star)
+
         renderer.draw(scene, cam, positions, app.sim.time, app.lensing,
                       vertex_count=vcount, line_kinds=app.visible_lines(),
                       extras=app.extra_ranges())
