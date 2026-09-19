@@ -15,3 +15,5 @@ I built Simulation Cluster, a real-time space simulator written in Python that r
 🛠️ BUILT WITH
 Python · Taichi · ModernGL · Pygame · NumPy · Dear ImGui
 
+The main code is main.py
+
